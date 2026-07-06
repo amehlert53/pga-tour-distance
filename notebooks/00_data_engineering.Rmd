@@ -212,8 +212,15 @@ involving ball speed or CHS should filter to `year >= SPEED_ERA_START`.
 
 ## 3.2b Missing rookie_year / turned_pro
 
-As with the speed metrics, we do not impute these — we document the gap and
-carry the NAs through into any variable derived from them.
+`turned_pro` is a weak proxy for PGA Tour entry regardless of missingness:
+checked directly against the data, the median gap between turning pro and a
+player's first PGA Tour season is 7 years, and 62% of players have a gap
+greater than 5 years (grinding through other tours first). Combined with
+`rookie_year`'s incompleteness below, neither field is used as the basis for
+any engineered variable in this notebook — `years_on_tour` and
+`entry_cohort` are instead built from the cross-referenced `entry_year`
+(section 3.4). `rookie_year`/`turned_pro` are kept as raw columns for
+reference only.
 
 ```{r rookie-year-na-check}
 missing_rookie_year <- df_clean %>%
@@ -223,14 +230,6 @@ cat("Rows missing rookie_year:   ", nrow(missing_rookie_year), "\n")
 cat("Players missing rookie_year:", n_distinct(missing_rookie_year$player_name), "\n")
 cat("Rows missing turned_pro:    ", sum(is.na(df_clean$turned_pro)), "\n")
 ```
-
-Because `rookie_year` is missing for all of a given player's rows rather
-than sporadically within a player's history, `years_on_tour` (section 4.1)
-will be NA for every row belonging to these players. Similarly, the single
-row with missing `turned_pro` will have an NA `cohort` (section 4.1). No
-imputation is applied; any analysis that depends on `years_on_tour` or
-`cohort` should be aware these players/rows will be excluded via NA
-propagation rather than explicitly filtered.
 
 ## 3.3 Minimum seasons filter
 
@@ -252,30 +251,105 @@ cat("Players with 2+ seasons:    ",
     sum(seasons_per_player$n_seasons >= MIN_SEASONS), "\n")
 ```
 
+## 3.4 True entry year (cross-referenced with trends data)
+
+`df_complete` only covers the strokes-gained era (2004+), so a player's
+first row here isn't necessarily their true PGA Tour debut — some players
+were already playing for years beforehand. `trends_acc_dist_1987_to_2025.csv`
+carries simpler stats (distance/accuracy only, no strokes-gained) but goes
+back to 1987, so we take the earliest year found in *either* source as the
+best available estimate of a player's true tour entry.
+
+```{r true-entry-year}
+first_year_complete <- df_clean %>%
+  group_by(player_name) %>%
+  summarise(first_year_complete = min(year), .groups = "drop")
+
+first_year_trends <- df_trends_raw %>%
+  rename(player_name = player) %>%
+  group_by(player_name) %>%
+  summarise(first_year_trends = min(year), .groups = "drop")
+
+TRENDS_START_YEAR <- min(df_trends_raw$year)
+
+entry_year_lookup <- first_year_complete %>%
+  left_join(first_year_trends, by = "player_name") %>%
+  mutate(
+    entry_year     = pmin(first_year_complete, first_year_trends, na.rm = TRUE),
+    left_truncated = entry_year == TRENDS_START_YEAR
+  ) %>%
+  select(player_name, entry_year, left_truncated)
+
+df_clean <- df_clean %>%
+  left_join(entry_year_lookup, by = "player_name")
+
+recovered <- first_year_complete %>%
+  left_join(first_year_trends, by = "player_name") %>%
+  filter(!is.na(first_year_trends) & first_year_trends < first_year_complete)
+
+cat("Players with entry_year recovered earlier via trends file:", nrow(recovered), "\n")
+cat("Players left_truncated (entry_year == trends file start,", TRENDS_START_YEAR, "):",
+    sum(entry_year_lookup$left_truncated), "\n")
+```
+
+Spot check a few recovered players against known PGA Tour debuts:
+
+```{r entry-year-spot-check}
+recovered %>%
+  left_join(entry_year_lookup, by = "player_name") %>%
+  arrange(entry_year) %>%
+  select(player_name, first_year_complete, entry_year) %>%
+  head(10) %>%
+  print()
+```
+
 ---
 
 # 4. Engineer Variables — df_complete
 
-## 4.1 Career and cohort variables
+## 4.1 Career tenure and cohort variables
+
+`entry_year` (section 3.4) is the true, cross-referenced tour-debut year and
+is the right time origin for tenure. `cohort` is split into two purpose-built
+variables rather than one: `entry_cohort` (decade of tour entry) is the
+right lens for career-stage/tenure questions (survival analysis, time-to-
+obsolescence); `birth_cohort` (decade of birth) isolates generational
+effects (equipment/training exposure by birth era) without conflating a
+young rookie with a late-blooming veteran who happened to enter the tour in
+the same decade.
 
 ```{r career-vars}
 df_clean <- df_clean %>%
   mutate(
-    # Years on tour (from rookie year)
-    years_on_tour = year - rookie_year,
+    # Tenure on tour, from the cross-referenced true entry year
+    years_on_tour = year - entry_year,
 
-    # Entry cohort by decade turned pro
-    cohort = case_when(
-      turned_pro < 2000              ~ "pre-2000",
-      turned_pro >= 2000 & turned_pro < 2010 ~ "2000–2009",
-      turned_pro >= 2010 & turned_pro < 2020 ~ "2010–2019",
-      turned_pro >= 2020             ~ "2020+",
-      TRUE                           ~ NA_character_
-    ) %>% factor(levels = c("pre-2000", "2000–2009", "2010–2019", "2020+"))
+    # Entry cohort: decade of true tour entry (career-stage lens)
+    entry_cohort = case_when(
+      entry_year < 2000                      ~ "pre-2000",
+      entry_year >= 2000 & entry_year < 2010  ~ "2000–2009",
+      entry_year >= 2010 & entry_year < 2020  ~ "2010–2019",
+      entry_year >= 2020                      ~ "2020+",
+      TRUE                                    ~ NA_character_
+    ) %>% factor(levels = c("pre-2000", "2000–2009", "2010–2019", "2020+")),
+
+    # Birth cohort: decade of birth (generational lens)
+    birth_cohort = case_when(
+      birth_year < 1970                     ~ "Pre-1970",
+      birth_year >= 1970 & birth_year < 1980 ~ "1970s",
+      birth_year >= 1980 & birth_year < 1990 ~ "1980s",
+      birth_year >= 1990 & birth_year < 2000 ~ "1990s",
+      birth_year >= 2000                     ~ "2000s+",
+      TRUE                                   ~ NA_character_
+    ) %>% factor(levels = c("Pre-1970", "1970s", "1980s", "1990s", "2000s+"))
   )
 
 df_clean %>%
-  count(cohort) %>%
+  count(entry_cohort) %>%
+  print()
+
+df_clean %>%
+  count(birth_cohort) %>%
   print()
 ```
 
@@ -363,17 +437,20 @@ df_clean %>%
   print()
 ```
 
-## 4.6 Career entry distance
+## 4.6 Career entry distance (strokes-gained era)
 
-Each player's distance in their first observed season. Used in survival
-analysis and rising floor analyses to ask "what did you arrive with?"
+Each player's distance in their first *strokes-gained-era* observed season
+(`sg_entry_year`) — distinct from the cross-referenced `entry_year` in
+section 3.4, since ball speed/CHS only exist within `df_complete`'s 2004+
+window. Used in survival analysis and rising floor analyses to ask "what did
+you arrive with, once we could measure speed?"
 
 ```{r entry-distance}
 entry_stats <- df_clean %>%
   group_by(player_name) %>%
   slice_min(year, n = 1, with_ties = FALSE) %>%
   select(player_name, dist_entry = distance, speed_entry = ball_speed,
-         chs_entry = chs, entry_year = year) %>%
+         chs_entry = chs, sg_entry_year = year) %>%
   ungroup()
 
 df_clean <- df_clean %>%
@@ -381,20 +458,20 @@ df_clean <- df_clean %>%
 
 # Quick check
 df_clean %>%
-  select(player_name, year, distance, dist_entry, entry_year) %>%
+  select(player_name, year, distance, dist_entry, sg_entry_year) %>%
   filter(player_name == first(player_name)) %>%
   print()
 ```
 
 ## 4.7 Distance quartile at career entry
 
-Used in survival analysis as a time-fixed predictor — what distance
-tier did a player arrive in?
+Used in survival analysis as a time-fixed predictor — what distance tier
+did a player arrive in (within the strokes-gained era)?
 
 ```{r entry-quartile}
 # Quartile within entry year's field
 entry_quartiles <- df_clean %>%
-  filter(year == entry_year) %>%
+  filter(year == sg_entry_year) %>%
   group_by(year) %>%
   mutate(dist_entry_quartile = ntile(distance, 4)) %>%
   ungroup() %>%
@@ -472,11 +549,12 @@ df_trends <- df_trends %>%
   select(-dist_vs_field_check, -acc_vs_field_check)
 ```
 
-## 5.4 Add cohort variable
+## 5.4 Add cohort variables
 
 ```{r trends-cohort}
-# For trends file we don't have turned_pro directly, so derive from
-# first observed year as a proxy for cohort grouping
+# This file already goes back to 1987, so its own first-observed-year is
+# already a good entry-year estimate for players who don't reach df_complete
+# (no separate cross-referencing needed, unlike df_main's entry_cohort).
 first_year_trends <- df_trends %>%
   group_by(player_name) %>%
   summarise(first_year = min(year)) %>%
@@ -485,7 +563,7 @@ first_year_trends <- df_trends %>%
 df_trends <- df_trends %>%
   left_join(first_year_trends, by = "player_name") %>%
   mutate(
-    cohort = case_when(
+    entry_cohort = case_when(
       first_year < 2000              ~ "pre-2000",
       first_year >= 2000 & first_year < 2010 ~ "2000–2009",
       first_year >= 2010 & first_year < 2020 ~ "2010–2019",
@@ -493,6 +571,19 @@ df_trends <- df_trends %>%
       TRUE                           ~ NA_character_
     ) %>% factor(levels = c("pre-2000", "2000–2009", "2010–2019", "2020+"))
   )
+
+# Enrich with birth_cohort where the player also appears in df_complete.
+# Coverage is partial: df_complete only covers 793 of df_trends's 1184 players.
+birth_lookup <- df_clean %>%
+  distinct(player_name, birth_cohort)
+
+df_trends <- df_trends %>%
+  left_join(birth_lookup, by = "player_name")
+
+cat("Players with birth_cohort available (matched to df_complete):",
+    n_distinct(df_trends$player_name[!is.na(df_trends$birth_cohort)]), "\n")
+cat("Total players in df_trends:                                 ",
+    n_distinct(df_trends$player_name), "\n")
 ```
 
 ---
@@ -507,16 +598,18 @@ cat("Rows:              ", nrow(df_clean), "\n")
 cat("Unique players:    ", n_distinct(df_clean$player_name), "\n")
 cat("Year range:        ", min(df_clean$year), "–", max(df_clean$year), "\n")
 cat("Engineered columns:\n")
-cat(" ", paste(c("years_on_tour", "cohort", "dist_vs_field", "acc_vs_field",
+cat(" ", paste(c("entry_year", "left_truncated", "years_on_tour",
+                 "entry_cohort", "birth_cohort", "dist_vs_field", "acc_vs_field",
                  "speed_vs_field", "chs_vs_field", "dist_player_mean",
                  "dist_within", "dist_quintile", "archetype",
-                 "dist_entry", "dist_entry_quartile"), collapse = "\n  "), "\n")
+                 "dist_entry", "sg_entry_year", "dist_entry_quartile"), collapse = "\n  "), "\n")
 
 # Spot check a well-known player if present
 if ("Tiger Woods" %in% df_clean$player_name) {
   df_clean %>%
     filter(player_name == "Tiger Woods") %>%
-    select(year, distance, dist_vs_field, dist_quintile, archetype, cohort) %>%
+    select(year, distance, dist_vs_field, dist_quintile, archetype,
+           entry_year, entry_cohort, birth_cohort, left_truncated) %>%
     print()
 }
 ```

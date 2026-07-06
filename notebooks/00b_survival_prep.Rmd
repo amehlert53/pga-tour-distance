@@ -1,0 +1,220 @@
+---
+title: "00b — Survival Data Preparation"
+subtitle: "PGA Tour Distance & Speed Analytics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+# Overview
+
+This notebook builds the survival-analysis dataset from `df_main.rds`. PGA
+Tour careers are not a clean rectangular panel — 35% of players miss at
+least one season, and in 165 individual cases a player missed 2+
+*consecutive* seasons and later returned (conditional status, injury, tour
+crossover, etc.). A single fixed rule like "2+ consecutive seasons absent =
+career ended" was checked directly against the data and found to
+misclassify well over 100 still-active careers.
+
+So this notebook does **not** decide what counts as "career ended." It only
+reconstructs the underlying structure — each player's distinct spells of
+consecutive seasons, and the gaps between them — and leaves the actual
+censoring/event threshold as an explicit, testable choice for
+`07_survival_analysis.Rmd` (e.g. comparing 2/3/4-year gap thresholds as a
+named sensitivity check, per `docs/project_context.md`).
+
+**Input:** `data/processed/df_main.rds`
+**Output:** `data/processed/df_survival.rds`
+
+---
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+
+source(here::here("config.R"))
+
+set.seed(2025)
+
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+---
+
+# 2. Load Processed Data
+
+```{r load-data}
+df_main <- readRDS(here(PATH_PROCESSED, "df_main.rds"))
+
+DATA_END_YEAR <- max(df_main$year)
+
+cat("Rows:          ", nrow(df_main), "\n")
+cat("Unique players:", n_distinct(df_main$player_name), "\n")
+cat("Data end year: ", DATA_END_YEAR, "\n")
+```
+
+---
+
+# 3. Reconstruct Spells
+
+A "spell" is a run of consecutive observed seasons for a player. A new spell
+starts whenever there's a gap of more than one year since the player's
+previous observed season.
+
+```{r spell-ids}
+spells <- df_main %>%
+  distinct(player_name, year) %>%
+  arrange(player_name, year) %>%
+  group_by(player_name) %>%
+  mutate(
+    gap_flag = coalesce(year - lag(year) > 1, FALSE),
+    spell_id = cumsum(gap_flag) + 1
+  ) %>%
+  ungroup()
+
+cat("Distribution of spells-per-player:\n")
+spells %>%
+  count(player_name, name = "n_years") %>%
+  count(player_name) %>%
+  nrow()
+
+spells %>%
+  group_by(player_name) %>%
+  summarise(n_spells = max(spell_id), .groups = "drop") %>%
+  count(n_spells) %>%
+  print()
+```
+
+## 3.1 Spell-level summary
+
+```{r spell-summary}
+spell_summary <- spells %>%
+  group_by(player_name, spell_id) %>%
+  summarise(
+    spell_start_year = min(year),
+    spell_end_year   = max(year),
+    .groups = "drop"
+  ) %>%
+  group_by(player_name) %>%
+  arrange(spell_id, .by_group = TRUE) %>%
+  mutate(
+    gap_before        = spell_start_year - lag(spell_end_year) - 1,
+    gap_after         = lead(spell_start_year) - spell_end_year - 1,
+    is_final_spell    = spell_id == max(spell_id),
+    final_gap_length  = if_else(is_final_spell, DATA_END_YEAR - spell_end_year, NA_integer_)
+  ) %>%
+  ungroup()
+
+# Every player should have exactly one final spell
+final_spell_counts <- spell_summary %>%
+  filter(is_final_spell) %>%
+  count(player_name) %>%
+  filter(n != 1)
+
+cat("Players without exactly one final spell (should be 0):", nrow(final_spell_counts), "\n")
+stopifnot(nrow(final_spell_counts) == 0)
+```
+
+## 3.2 Spot check — Arjun Atwal
+
+Known pattern: seasons 2004–2006, 2011–2012, 2020 (two multi-year gaps,
+including a 7-year gap before returning in 2020).
+
+```{r spot-check-atwal}
+spell_summary %>%
+  filter(player_name == "Arjun Atwal") %>%
+  print()
+```
+
+---
+
+# 4. Build Survival Dataset
+
+Join spell structure back onto each player-year row, and add the start-stop
+time axis (`time_start`/`time_stop`) using calendar tenure from the
+cross-referenced `entry_year` (not `rookie_year` — see
+`00_data_engineering.Rmd` sections 3.2b/3.4/4.1 for why).
+
+```{r build-survival}
+spells_with_id <- spells %>% select(player_name, year, spell_id)
+
+df_survival <- df_main %>%
+  left_join(spells_with_id, by = c("player_name", "year")) %>%
+  left_join(spell_summary, by = c("player_name", "spell_id")) %>%
+  mutate(
+    time_start = year - entry_year,
+    time_stop  = time_start + 1
+  ) %>%
+  select(
+    player_name, year, entry_year, left_truncated, entry_cohort,
+    spell_id, spell_start_year, spell_end_year,
+    gap_before, gap_after, is_final_spell, final_gap_length,
+    time_start, time_stop,
+    dist_entry_quartile, dist_vs_field, sg_total, age
+  )
+
+cat("Rows in df_survival:", nrow(df_survival), "\n")
+cat("Rows in df_main:    ", nrow(df_main), "\n")
+stopifnot(nrow(df_survival) == nrow(df_main))
+```
+
+---
+
+# 5. Final Checks
+
+```{r final-checks}
+cat("=== df_survival ===\n")
+cat("Rows:              ", nrow(df_survival), "\n")
+cat("Unique players:    ", n_distinct(df_survival$player_name), "\n")
+cat("Year range:        ", min(df_survival$year), "–", max(df_survival$year), "\n")
+
+cat("\nleft_truncated players:", n_distinct(df_survival$player_name[df_survival$left_truncated]), "\n")
+
+cat("\nfinal_gap_length distribution (final-spell rows only):\n")
+df_survival %>%
+  filter(is_final_spell) %>%
+  count(final_gap_length) %>%
+  arrange(final_gap_length) %>%
+  print()
+
+# Spot check a well-known player if present
+if ("Tiger Woods" %in% df_survival$player_name) {
+  df_survival %>%
+    filter(player_name == "Tiger Woods") %>%
+    select(year, entry_year, spell_id, gap_before, gap_after, time_start, time_stop) %>%
+    print()
+}
+```
+
+---
+
+# 6. Write Output
+
+```{r write-output}
+saveRDS(df_survival, here(PATH_PROCESSED, "df_survival.rds"))
+
+cat("Output written to data/processed/df_survival.rds —",
+    nrow(df_survival), "rows,", n_distinct(df_survival$player_name), "players\n")
+```
+
+---
+
+# 7. Session Info
+
+```{r session-info}
+sessionInfo()
+```

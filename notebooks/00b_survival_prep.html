@@ -12,7 +12,7 @@
 
 <meta name="date" content="2026-07-06" />
 
-<title>00 — Data Engineering</title>
+<title>00b — Survival Data Preparation</title>
 
 <script>// Pandoc 2.9 adds attributes on both header and div. We remove the former (to
 // be compatible with the behavior of Pandoc < 2.8).
@@ -2839,7 +2839,7 @@ border-radius: 0px;
 
 
 
-<h1 class="title toc-ignore">00 — Data Engineering</h1>
+<h1 class="title toc-ignore">00b — Survival Data Preparation</h1>
 <h3 class="subtitle">PGA Tour Distance &amp; Speed Analytics</h3>
 <h4 class="date">2026-07-06</h4>
 
@@ -2848,756 +2848,236 @@ border-radius: 0px;
 
 <div id="overview" class="section level1">
 <h1>Overview</h1>
-<p>This notebook is the single source of truth for all data cleaning and
-variable engineering in this project. It reads the two raw datasets,
-applies cleaning decisions, engineers all derived variables, and writes
-processed outputs to <code>data/processed/</code>. Every subsequent
-analysis notebook loads from those outputs rather than re-processing the
-raw data.</p>
-<p><strong>Inputs:</strong> - <code>data/raw/df_complete.csv</code> —
-Player-season records, 2004–2025 -
-<code>data/raw/trends_acc_dist_1987_to_2025.csv</code> — Distance and
-accuracy, 1987–2025</p>
-<p><strong>Outputs:</strong> - <code>data/processed/df_main.rds</code> —
-Cleaned and engineered df_complete -
-<code>data/processed/df_trends.rds</code> — Cleaned df_trends</p>
-<p><strong>Note on survival data:</strong> The survival analysis dataset
-(<code>df_survival.rds</code>) is constructed separately in
-<code>00b_survival_prep.Rmd</code> once we have sufficient familiarity
-with career gap patterns in the data to make defensible censoring
-decisions.</p>
+<p>This notebook builds the survival-analysis dataset from
+<code>df_main.rds</code>. PGA Tour careers are not a clean rectangular
+panel — 35% of players miss at least one season, and in 165 individual
+cases a player missed 2+ <em>consecutive</em> seasons and later returned
+(conditional status, injury, tour crossover, etc.). A single fixed rule
+like “2+ consecutive seasons absent = career ended” was checked directly
+against the data and found to misclassify well over 100 still-active
+careers.</p>
+<p>So this notebook does <strong>not</strong> decide what counts as
+“career ended.” It only reconstructs the underlying structure — each
+player’s distinct spells of consecutive seasons, and the gaps between
+them — and leaves the actual censoring/event threshold as an explicit,
+testable choice for <code>07_survival_analysis.Rmd</code>
+(e.g. comparing 2/3/4-year gap thresholds as a named sensitivity check,
+per <code>docs/project_context.md</code>).</p>
+<p><strong>Input:</strong> <code>data/processed/df_main.rds</code>
+<strong>Output:</strong> <code>data/processed/df_survival.rds</code></p>
 <hr />
 </div>
 <div id="setup" class="section level1">
 <h1>1. Setup</h1>
-<div class="sourceCode" id="cb1"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb1-1"><a href="#cb1-1" tabindex="-1"></a><span class="co"># Core</span></span>
-<span id="cb1-2"><a href="#cb1-2" tabindex="-1"></a><span class="fu">library</span>(tidyverse)</span>
-<span id="cb1-3"><a href="#cb1-3" tabindex="-1"></a><span class="fu">library</span>(here)</span>
-<span id="cb1-4"><a href="#cb1-4" tabindex="-1"></a></span>
-<span id="cb1-5"><a href="#cb1-5" tabindex="-1"></a><span class="co"># Utilities</span></span>
-<span id="cb1-6"><a href="#cb1-6" tabindex="-1"></a><span class="fu">library</span>(broom)</span>
+<div class="sourceCode" id="cb1"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb1-1"><a href="#cb1-1" tabindex="-1"></a><span class="fu">library</span>(tidyverse)</span>
+<span id="cb1-2"><a href="#cb1-2" tabindex="-1"></a><span class="fu">library</span>(here)</span>
+<span id="cb1-3"><a href="#cb1-3" tabindex="-1"></a></span>
+<span id="cb1-4"><a href="#cb1-4" tabindex="-1"></a><span class="fu">source</span>(here<span class="sc">::</span><span class="fu">here</span>(<span class="st">&quot;config.R&quot;</span>))</span>
+<span id="cb1-5"><a href="#cb1-5" tabindex="-1"></a></span>
+<span id="cb1-6"><a href="#cb1-6" tabindex="-1"></a><span class="fu">set.seed</span>(<span class="dv">2025</span>)</span>
 <span id="cb1-7"><a href="#cb1-7" tabindex="-1"></a></span>
-<span id="cb1-8"><a href="#cb1-8" tabindex="-1"></a><span class="co"># Source shared config (paths, constants, regulatory events, plot theme)</span></span>
-<span id="cb1-9"><a href="#cb1-9" tabindex="-1"></a><span class="fu">source</span>(here<span class="sc">::</span><span class="fu">here</span>(<span class="st">&quot;config.R&quot;</span>))</span>
-<span id="cb1-10"><a href="#cb1-10" tabindex="-1"></a></span>
-<span id="cb1-11"><a href="#cb1-11" tabindex="-1"></a><span class="co"># Reproducibility</span></span>
-<span id="cb1-12"><a href="#cb1-12" tabindex="-1"></a><span class="fu">set.seed</span>(<span class="dv">2025</span>)</span>
-<span id="cb1-13"><a href="#cb1-13" tabindex="-1"></a></span>
-<span id="cb1-14"><a href="#cb1-14" tabindex="-1"></a><span class="co"># Global knitr options</span></span>
-<span id="cb1-15"><a href="#cb1-15" tabindex="-1"></a>knitr<span class="sc">::</span>opts_chunk<span class="sc">$</span><span class="fu">set</span>(</span>
-<span id="cb1-16"><a href="#cb1-16" tabindex="-1"></a>  <span class="at">echo    =</span> <span class="cn">TRUE</span>,</span>
-<span id="cb1-17"><a href="#cb1-17" tabindex="-1"></a>  <span class="at">message =</span> <span class="cn">FALSE</span>,</span>
-<span id="cb1-18"><a href="#cb1-18" tabindex="-1"></a>  <span class="at">warning =</span> <span class="cn">FALSE</span>,</span>
-<span id="cb1-19"><a href="#cb1-19" tabindex="-1"></a>  <span class="at">fig.width  =</span> <span class="dv">10</span>,</span>
-<span id="cb1-20"><a href="#cb1-20" tabindex="-1"></a>  <span class="at">fig.height =</span> <span class="dv">6</span></span>
-<span id="cb1-21"><a href="#cb1-21" tabindex="-1"></a>)</span></code></pre></div>
+<span id="cb1-8"><a href="#cb1-8" tabindex="-1"></a>knitr<span class="sc">::</span>opts_chunk<span class="sc">$</span><span class="fu">set</span>(</span>
+<span id="cb1-9"><a href="#cb1-9" tabindex="-1"></a>  <span class="at">echo    =</span> <span class="cn">TRUE</span>,</span>
+<span id="cb1-10"><a href="#cb1-10" tabindex="-1"></a>  <span class="at">message =</span> <span class="cn">FALSE</span>,</span>
+<span id="cb1-11"><a href="#cb1-11" tabindex="-1"></a>  <span class="at">warning =</span> <span class="cn">FALSE</span>,</span>
+<span id="cb1-12"><a href="#cb1-12" tabindex="-1"></a>  <span class="at">fig.width  =</span> <span class="dv">10</span>,</span>
+<span id="cb1-13"><a href="#cb1-13" tabindex="-1"></a>  <span class="at">fig.height =</span> <span class="dv">6</span></span>
+<span id="cb1-14"><a href="#cb1-14" tabindex="-1"></a>)</span></code></pre></div>
 <hr />
 </div>
-<div id="load-raw-data" class="section level1">
-<h1>2. Load Raw Data</h1>
-<div class="sourceCode" id="cb2"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" tabindex="-1"></a>df_raw <span class="ot">&lt;-</span> <span class="fu">read_csv</span>(</span>
-<span id="cb2-2"><a href="#cb2-2" tabindex="-1"></a>  <span class="fu">here</span>(PATH_RAW, <span class="st">&quot;df_complete.csv&quot;</span>),</span>
-<span id="cb2-3"><a href="#cb2-3" tabindex="-1"></a>  <span class="at">show_col_types =</span> <span class="cn">FALSE</span></span>
-<span id="cb2-4"><a href="#cb2-4" tabindex="-1"></a>)</span>
-<span id="cb2-5"><a href="#cb2-5" tabindex="-1"></a></span>
-<span id="cb2-6"><a href="#cb2-6" tabindex="-1"></a>df_trends_raw <span class="ot">&lt;-</span> <span class="fu">read_csv</span>(</span>
-<span id="cb2-7"><a href="#cb2-7" tabindex="-1"></a>  <span class="fu">here</span>(PATH_RAW, <span class="st">&quot;trends_acc_dist_1987_to_2025.csv&quot;</span>),</span>
-<span id="cb2-8"><a href="#cb2-8" tabindex="-1"></a>  <span class="at">show_col_types =</span> <span class="cn">FALSE</span></span>
-<span id="cb2-9"><a href="#cb2-9" tabindex="-1"></a>)</span></code></pre></div>
-<div id="initial-inspection-df_complete" class="section level2">
-<h2>2.1 Initial inspection — df_complete</h2>
-<p>We rely on <code>player_name</code> + <code>year</code> as the unique
-key for this dataset in every downstream <code>left_join</code>. Confirm
-that holds before trusting any join result.</p>
-<div class="sourceCode" id="cb3"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb3-1"><a href="#cb3-1" tabindex="-1"></a>n_dupes_complete <span class="ot">&lt;-</span> df_raw <span class="sc">%&gt;%</span></span>
-<span id="cb3-2"><a href="#cb3-2" tabindex="-1"></a>  <span class="fu">count</span>(player_name, year) <span class="sc">%&gt;%</span></span>
-<span id="cb3-3"><a href="#cb3-3" tabindex="-1"></a>  <span class="fu">filter</span>(n <span class="sc">&gt;</span> <span class="dv">1</span>) <span class="sc">%&gt;%</span></span>
-<span id="cb3-4"><a href="#cb3-4" tabindex="-1"></a>  <span class="fu">nrow</span>()</span>
-<span id="cb3-5"><a href="#cb3-5" tabindex="-1"></a></span>
-<span id="cb3-6"><a href="#cb3-6" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Rows:                    &quot;</span>, <span class="fu">nrow</span>(df_raw), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Rows:                     4175</code></pre>
-<div class="sourceCode" id="cb5"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb5-1"><a href="#cb5-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Distinct player+year keys:&quot;</span>, <span class="fu">n_distinct</span>(df_raw<span class="sc">$</span>player_name, df_raw<span class="sc">$</span>year), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Distinct player+year keys: 4175</code></pre>
-<div class="sourceCode" id="cb7"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Duplicate player+year keys:&quot;</span>, n_dupes_complete, <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Duplicate player+year keys: 0</code></pre>
-<div class="sourceCode" id="cb9"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" tabindex="-1"></a><span class="fu">stopifnot</span>(n_dupes_complete <span class="sc">==</span> <span class="dv">0</span>)</span></code></pre></div>
-<div class="sourceCode" id="cb10"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb10-1"><a href="#cb10-1" tabindex="-1"></a><span class="fu">glimpse</span>(df_raw)</span></code></pre></div>
-<pre><code>## Rows: 4,175
-## Columns: 17
-## $ player_name    &lt;chr&gt; &quot;Aaron Baddeley&quot;, &quot;Aaron Baddeley&quot;, &quot;Aaron Baddeley&quot;, &quot;…
-## $ year           &lt;dbl&gt; 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2…
-## $ accuracy       &lt;dbl&gt; 53.08, 53.32, 60.73, 60.00, 59.45, 56.48, 56.65, 55.67,…
-## $ ball_speed     &lt;dbl&gt; NA, NA, NA, 173.05, 171.04, 170.19, 177.01, 176.34, 176…
-## $ carry_distance &lt;dbl&gt; NA, NA, NA, 273.7, 274.7, 273.1, 286.6, 281.7, 288.8, 2…
-## $ chs            &lt;dbl&gt; NA, NA, NA, 118.45, 116.37, 115.10, 119.95, 119.14, 119…
-## $ distance       &lt;dbl&gt; 288.0, 291.4, 288.3, 291.9, 290.3, 287.8, 298.9, 296.2,…
-## $ sg_putt        &lt;dbl&gt; 0.579, 0.575, 0.595, 0.629, 0.762, 0.604, 0.502, 0.324,…
-## $ sg_ttg         &lt;dbl&gt; -1.008, -0.815, -0.517, 0.435, 0.123, -0.755, -0.294, 0…
-## $ sg_ott         &lt;dbl&gt; -0.530, -0.726, -0.106, 0.152, 0.096, -0.459, 0.112, 0.…
-## $ sg_apr         &lt;dbl&gt; -0.679, -0.280, -0.607, -0.252, -0.192, -0.507, -0.797,…
-## $ sg_arg         &lt;dbl&gt; 0.201, 0.191, 0.196, 0.535, 0.218, 0.212, 0.391, 0.438,…
-## $ sg_total       &lt;dbl&gt; -0.429, -0.240, 0.078, 1.064, 0.885, -0.151, 0.208, 1.1…
-## $ birth_year     &lt;dbl&gt; 1981, 1981, 1981, 1981, 1981, 1981, 1981, 1981, 1981, 1…
-## $ turned_pro     &lt;dbl&gt; 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2…
-## $ `rookie year`  &lt;dbl&gt; 2003, 2003, 2003, 2003, 2003, 2003, 2003, 2003, 2003, 2…
-## $ age            &lt;dbl&gt; 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36,…</code></pre>
-<div class="sourceCode" id="cb12"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb12-1"><a href="#cb12-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Rows:           &quot;</span>, <span class="fu">nrow</span>(df_raw), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Rows:            4175</code></pre>
-<div class="sourceCode" id="cb14"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb14-1"><a href="#cb14-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Unique players: &quot;</span>, <span class="fu">n_distinct</span>(df_raw<span class="sc">$</span>player_name), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Unique players:  793</code></pre>
-<div class="sourceCode" id="cb16"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb16-1"><a href="#cb16-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Year range:     &quot;</span>, <span class="fu">min</span>(df_raw<span class="sc">$</span>year), <span class="st">&quot;–&quot;</span>, <span class="fu">max</span>(df_raw<span class="sc">$</span>year), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Year range:      2004 – 2025</code></pre>
-<div class="sourceCode" id="cb18"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb18-1"><a href="#cb18-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;</span><span class="sc">\n</span><span class="st">NA counts:</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## 
-## NA counts:</code></pre>
-<div class="sourceCode" id="cb20"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb20-1"><a href="#cb20-1" tabindex="-1"></a>df_raw <span class="sc">%&gt;%</span></span>
-<span id="cb20-2"><a href="#cb20-2" tabindex="-1"></a>  <span class="fu">summarise</span>(<span class="fu">across</span>(<span class="fu">everything</span>(), <span class="sc">~</span><span class="fu">sum</span>(<span class="fu">is.na</span>(.)))) <span class="sc">%&gt;%</span></span>
-<span id="cb20-3"><a href="#cb20-3" tabindex="-1"></a>  <span class="fu">pivot_longer</span>(<span class="fu">everything</span>(), <span class="at">names_to =</span> <span class="st">&quot;column&quot;</span>, <span class="at">values_to =</span> <span class="st">&quot;n_missing&quot;</span>) <span class="sc">%&gt;%</span></span>
-<span id="cb20-4"><a href="#cb20-4" tabindex="-1"></a>  <span class="fu">filter</span>(n_missing <span class="sc">&gt;</span> <span class="dv">0</span>) <span class="sc">%&gt;%</span></span>
-<span id="cb20-5"><a href="#cb20-5" tabindex="-1"></a>  <span class="fu">print</span>()</span></code></pre></div>
+<div id="load-processed-data" class="section level1">
+<h1>2. Load Processed Data</h1>
+<div class="sourceCode" id="cb2"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" tabindex="-1"></a>df_main <span class="ot">&lt;-</span> <span class="fu">readRDS</span>(<span class="fu">here</span>(PATH_PROCESSED, <span class="st">&quot;df_main.rds&quot;</span>))</span>
+<span id="cb2-2"><a href="#cb2-2" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" tabindex="-1"></a>DATA_END_YEAR <span class="ot">&lt;-</span> <span class="fu">max</span>(df_main<span class="sc">$</span>year)</span>
+<span id="cb2-4"><a href="#cb2-4" tabindex="-1"></a></span>
+<span id="cb2-5"><a href="#cb2-5" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Rows:          &quot;</span>, <span class="fu">nrow</span>(df_main), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
+<pre><code>## Rows:           4175</code></pre>
+<div class="sourceCode" id="cb4"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Unique players:&quot;</span>, <span class="fu">n_distinct</span>(df_main<span class="sc">$</span>player_name), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
+<pre><code>## Unique players: 793</code></pre>
+<div class="sourceCode" id="cb6"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb6-1"><a href="#cb6-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Data end year: &quot;</span>, DATA_END_YEAR, <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
+<pre><code>## Data end year:  2025</code></pre>
+<hr />
+</div>
+<div id="reconstruct-spells" class="section level1">
+<h1>3. Reconstruct Spells</h1>
+<p>A “spell” is a run of consecutive observed seasons for a player. A
+new spell starts whenever there’s a gap of more than one year since the
+player’s previous observed season.</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" tabindex="-1"></a>spells <span class="ot">&lt;-</span> df_main <span class="sc">%&gt;%</span></span>
+<span id="cb8-2"><a href="#cb8-2" tabindex="-1"></a>  <span class="fu">distinct</span>(player_name, year) <span class="sc">%&gt;%</span></span>
+<span id="cb8-3"><a href="#cb8-3" tabindex="-1"></a>  <span class="fu">arrange</span>(player_name, year) <span class="sc">%&gt;%</span></span>
+<span id="cb8-4"><a href="#cb8-4" tabindex="-1"></a>  <span class="fu">group_by</span>(player_name) <span class="sc">%&gt;%</span></span>
+<span id="cb8-5"><a href="#cb8-5" tabindex="-1"></a>  <span class="fu">mutate</span>(</span>
+<span id="cb8-6"><a href="#cb8-6" tabindex="-1"></a>    <span class="at">gap_flag =</span> <span class="fu">coalesce</span>(year <span class="sc">-</span> <span class="fu">lag</span>(year) <span class="sc">&gt;</span> <span class="dv">1</span>, <span class="cn">FALSE</span>),</span>
+<span id="cb8-7"><a href="#cb8-7" tabindex="-1"></a>    <span class="at">spell_id =</span> <span class="fu">cumsum</span>(gap_flag) <span class="sc">+</span> <span class="dv">1</span></span>
+<span id="cb8-8"><a href="#cb8-8" tabindex="-1"></a>  ) <span class="sc">%&gt;%</span></span>
+<span id="cb8-9"><a href="#cb8-9" tabindex="-1"></a>  <span class="fu">ungroup</span>()</span>
+<span id="cb8-10"><a href="#cb8-10" tabindex="-1"></a></span>
+<span id="cb8-11"><a href="#cb8-11" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Distribution of spells-per-player:</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
+<pre><code>## Distribution of spells-per-player:</code></pre>
+<div class="sourceCode" id="cb10"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb10-1"><a href="#cb10-1" tabindex="-1"></a>spells <span class="sc">%&gt;%</span></span>
+<span id="cb10-2"><a href="#cb10-2" tabindex="-1"></a>  <span class="fu">count</span>(player_name, <span class="at">name =</span> <span class="st">&quot;n_years&quot;</span>) <span class="sc">%&gt;%</span></span>
+<span id="cb10-3"><a href="#cb10-3" tabindex="-1"></a>  <span class="fu">count</span>(player_name) <span class="sc">%&gt;%</span></span>
+<span id="cb10-4"><a href="#cb10-4" tabindex="-1"></a>  <span class="fu">nrow</span>()</span></code></pre></div>
+<pre><code>## [1] 793</code></pre>
+<div class="sourceCode" id="cb12"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb12-1"><a href="#cb12-1" tabindex="-1"></a>spells <span class="sc">%&gt;%</span></span>
+<span id="cb12-2"><a href="#cb12-2" tabindex="-1"></a>  <span class="fu">group_by</span>(player_name) <span class="sc">%&gt;%</span></span>
+<span id="cb12-3"><a href="#cb12-3" tabindex="-1"></a>  <span class="fu">summarise</span>(<span class="at">n_spells =</span> <span class="fu">max</span>(spell_id), <span class="at">.groups =</span> <span class="st">&quot;drop&quot;</span>) <span class="sc">%&gt;%</span></span>
+<span id="cb12-4"><a href="#cb12-4" tabindex="-1"></a>  <span class="fu">count</span>(n_spells) <span class="sc">%&gt;%</span></span>
+<span id="cb12-5"><a href="#cb12-5" tabindex="-1"></a>  <span class="fu">print</span>()</span></code></pre></div>
 <pre><code>## # A tibble: 5 × 2
-##   column         n_missing
-##   &lt;chr&gt;              &lt;int&gt;
-## 1 ball_speed           594
-## 2 carry_distance       594
-## 3 chs                  594
-## 4 turned_pro             1
-## 5 rookie year           79</code></pre>
-<p>Sanity-check that key measures fall within plausible bounds for PGA
-Tour play. This is a coarse guard against data-entry errors, not a claim
-about true physical limits — values outside these ranges are reported,
-not dropped.</p>
-<div class="sourceCode" id="cb22"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb22-1"><a href="#cb22-1" tabindex="-1"></a>df_raw <span class="sc">%&gt;%</span></span>
-<span id="cb22-2"><a href="#cb22-2" tabindex="-1"></a>  <span class="fu">summarise</span>(</span>
-<span id="cb22-3"><a href="#cb22-3" tabindex="-1"></a>    <span class="at">accuracy_out_of_range =</span> <span class="fu">sum</span>(accuracy <span class="sc">&lt;</span> <span class="dv">0</span> <span class="sc">|</span> accuracy <span class="sc">&gt;</span> <span class="dv">100</span>, <span class="at">na.rm =</span> <span class="cn">TRUE</span>),</span>
-<span id="cb22-4"><a href="#cb22-4" tabindex="-1"></a>    <span class="at">distance_out_of_range =</span> <span class="fu">sum</span>(distance <span class="sc">&lt;</span> <span class="dv">200</span> <span class="sc">|</span> distance <span class="sc">&gt;</span> <span class="dv">350</span>, <span class="at">na.rm =</span> <span class="cn">TRUE</span>),</span>
-<span id="cb22-5"><a href="#cb22-5" tabindex="-1"></a>    <span class="at">ball_speed_out_of_range =</span> <span class="fu">sum</span>(ball_speed <span class="sc">&lt;</span> <span class="dv">140</span> <span class="sc">|</span> ball_speed <span class="sc">&gt;</span> <span class="dv">200</span>, <span class="at">na.rm =</span> <span class="cn">TRUE</span>),</span>
-<span id="cb22-6"><a href="#cb22-6" tabindex="-1"></a>    <span class="at">chs_out_of_range =</span> <span class="fu">sum</span>(chs <span class="sc">&lt;</span> <span class="dv">90</span> <span class="sc">|</span> chs <span class="sc">&gt;</span> <span class="dv">140</span>, <span class="at">na.rm =</span> <span class="cn">TRUE</span>),</span>
-<span id="cb22-7"><a href="#cb22-7" tabindex="-1"></a>    <span class="at">carry_out_of_range =</span> <span class="fu">sum</span>(carry_distance <span class="sc">&lt;</span> <span class="dv">200</span> <span class="sc">|</span> carry_distance <span class="sc">&gt;</span> <span class="dv">320</span>, <span class="at">na.rm =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb22-8"><a href="#cb22-8" tabindex="-1"></a>  ) <span class="sc">%&gt;%</span></span>
-<span id="cb22-9"><a href="#cb22-9" tabindex="-1"></a>  <span class="fu">print</span>()</span></code></pre></div>
-<pre><code>## # A tibble: 1 × 5
-##   accuracy_out_of_range distance_out_of_range ball_speed_out_of_range
-##                   &lt;int&gt;                 &lt;int&gt;                   &lt;int&gt;
-## 1                     0                     0                       0
-## # ℹ 2 more variables: chs_out_of_range &lt;int&gt;, carry_out_of_range &lt;int&gt;</code></pre>
+##   n_spells     n
+##      &lt;dbl&gt; &lt;int&gt;
+## 1        1   516
+## 2        2   203
+## 3        3    61
+## 4        4    11
+## 5        5     2</code></pre>
+<div id="spell-level-summary" class="section level2">
+<h2>3.1 Spell-level summary</h2>
+<div class="sourceCode" id="cb14"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb14-1"><a href="#cb14-1" tabindex="-1"></a>spell_summary <span class="ot">&lt;-</span> spells <span class="sc">%&gt;%</span></span>
+<span id="cb14-2"><a href="#cb14-2" tabindex="-1"></a>  <span class="fu">group_by</span>(player_name, spell_id) <span class="sc">%&gt;%</span></span>
+<span id="cb14-3"><a href="#cb14-3" tabindex="-1"></a>  <span class="fu">summarise</span>(</span>
+<span id="cb14-4"><a href="#cb14-4" tabindex="-1"></a>    <span class="at">spell_start_year =</span> <span class="fu">min</span>(year),</span>
+<span id="cb14-5"><a href="#cb14-5" tabindex="-1"></a>    <span class="at">spell_end_year   =</span> <span class="fu">max</span>(year),</span>
+<span id="cb14-6"><a href="#cb14-6" tabindex="-1"></a>    <span class="at">.groups =</span> <span class="st">&quot;drop&quot;</span></span>
+<span id="cb14-7"><a href="#cb14-7" tabindex="-1"></a>  ) <span class="sc">%&gt;%</span></span>
+<span id="cb14-8"><a href="#cb14-8" tabindex="-1"></a>  <span class="fu">group_by</span>(player_name) <span class="sc">%&gt;%</span></span>
+<span id="cb14-9"><a href="#cb14-9" tabindex="-1"></a>  <span class="fu">arrange</span>(spell_id, <span class="at">.by_group =</span> <span class="cn">TRUE</span>) <span class="sc">%&gt;%</span></span>
+<span id="cb14-10"><a href="#cb14-10" tabindex="-1"></a>  <span class="fu">mutate</span>(</span>
+<span id="cb14-11"><a href="#cb14-11" tabindex="-1"></a>    <span class="at">gap_before        =</span> spell_start_year <span class="sc">-</span> <span class="fu">lag</span>(spell_end_year) <span class="sc">-</span> <span class="dv">1</span>,</span>
+<span id="cb14-12"><a href="#cb14-12" tabindex="-1"></a>    <span class="at">gap_after         =</span> <span class="fu">lead</span>(spell_start_year) <span class="sc">-</span> spell_end_year <span class="sc">-</span> <span class="dv">1</span>,</span>
+<span id="cb14-13"><a href="#cb14-13" tabindex="-1"></a>    <span class="at">is_final_spell    =</span> spell_id <span class="sc">==</span> <span class="fu">max</span>(spell_id),</span>
+<span id="cb14-14"><a href="#cb14-14" tabindex="-1"></a>    <span class="at">final_gap_length  =</span> <span class="fu">if_else</span>(is_final_spell, DATA_END_YEAR <span class="sc">-</span> spell_end_year, <span class="cn">NA_integer_</span>)</span>
+<span id="cb14-15"><a href="#cb14-15" tabindex="-1"></a>  ) <span class="sc">%&gt;%</span></span>
+<span id="cb14-16"><a href="#cb14-16" tabindex="-1"></a>  <span class="fu">ungroup</span>()</span>
+<span id="cb14-17"><a href="#cb14-17" tabindex="-1"></a></span>
+<span id="cb14-18"><a href="#cb14-18" tabindex="-1"></a><span class="co"># Every player should have exactly one final spell</span></span>
+<span id="cb14-19"><a href="#cb14-19" tabindex="-1"></a>final_spell_counts <span class="ot">&lt;-</span> spell_summary <span class="sc">%&gt;%</span></span>
+<span id="cb14-20"><a href="#cb14-20" tabindex="-1"></a>  <span class="fu">filter</span>(is_final_spell) <span class="sc">%&gt;%</span></span>
+<span id="cb14-21"><a href="#cb14-21" tabindex="-1"></a>  <span class="fu">count</span>(player_name) <span class="sc">%&gt;%</span></span>
+<span id="cb14-22"><a href="#cb14-22" tabindex="-1"></a>  <span class="fu">filter</span>(n <span class="sc">!=</span> <span class="dv">1</span>)</span>
+<span id="cb14-23"><a href="#cb14-23" tabindex="-1"></a></span>
+<span id="cb14-24"><a href="#cb14-24" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Players without exactly one final spell (should be 0):&quot;</span>, <span class="fu">nrow</span>(final_spell_counts), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
+<pre><code>## Players without exactly one final spell (should be 0): 0</code></pre>
+<div class="sourceCode" id="cb16"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb16-1"><a href="#cb16-1" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="fu">nrow</span>(final_spell_counts) <span class="sc">==</span> <span class="dv">0</span>)</span></code></pre></div>
 </div>
-<div id="initial-inspection-df_trends" class="section level2">
-<h2>2.2 Initial inspection — df_trends</h2>
-<div class="sourceCode" id="cb24"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb24-1"><a href="#cb24-1" tabindex="-1"></a>n_dupes_trends <span class="ot">&lt;-</span> df_trends_raw <span class="sc">%&gt;%</span></span>
-<span id="cb24-2"><a href="#cb24-2" tabindex="-1"></a>  <span class="fu">count</span>(player, year) <span class="sc">%&gt;%</span></span>
-<span id="cb24-3"><a href="#cb24-3" tabindex="-1"></a>  <span class="fu">filter</span>(n <span class="sc">&gt;</span> <span class="dv">1</span>) <span class="sc">%&gt;%</span></span>
-<span id="cb24-4"><a href="#cb24-4" tabindex="-1"></a>  <span class="fu">nrow</span>()</span>
-<span id="cb24-5"><a href="#cb24-5" tabindex="-1"></a></span>
-<span id="cb24-6"><a href="#cb24-6" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Rows:                    &quot;</span>, <span class="fu">nrow</span>(df_trends_raw), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Rows:                     7400</code></pre>
-<div class="sourceCode" id="cb26"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb26-1"><a href="#cb26-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Distinct player+year keys:&quot;</span>, <span class="fu">n_distinct</span>(df_trends_raw<span class="sc">$</span>player, df_trends_raw<span class="sc">$</span>year), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Distinct player+year keys: 7400</code></pre>
-<div class="sourceCode" id="cb28"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb28-1"><a href="#cb28-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Duplicate player+year keys:&quot;</span>, n_dupes_trends, <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Duplicate player+year keys: 0</code></pre>
-<div class="sourceCode" id="cb30"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb30-1"><a href="#cb30-1" tabindex="-1"></a><span class="fu">stopifnot</span>(n_dupes_trends <span class="sc">==</span> <span class="dv">0</span>)</span></code></pre></div>
-<div class="sourceCode" id="cb31"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb31-1"><a href="#cb31-1" tabindex="-1"></a><span class="fu">glimpse</span>(df_trends_raw)</span></code></pre></div>
-<pre><code>## Rows: 7,400
-## Columns: 8
-## $ player              &lt;chr&gt; &quot;Aaron Baddeley&quot;, &quot;Aaron Baddeley&quot;, &quot;Aaron Baddele…
-## $ distance            &lt;dbl&gt; 287.9, 288.0, 291.4, 288.3, 291.9, 290.3, 287.8, 2…
-## $ year                &lt;dbl&gt; 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 20…
-## $ accuracy            &lt;dbl&gt; 56.16, 53.08, 53.32, 60.73, 60.00, 59.45, 56.48, 5…
-## $ distance_season_avg &lt;dbl&gt; 286.5689, 287.1750, 288.5738, 289.4985, 289.0791, …
-## $ accuracy_season_avg &lt;dbl&gt; 66.13137, 64.08582, 62.80851, 63.38010, 63.52000, …
-## $ relative_distance   &lt;dbl&gt; 1.3310526, 0.8250000, 2.8262376, -1.1984694, 2.820…
-## $ relative_accuracy   &lt;dbl&gt; -9.9713684, -11.0058163, -9.4885149, -2.6501020, -…</code></pre>
-<div class="sourceCode" id="cb33"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb33-1"><a href="#cb33-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Rows:           &quot;</span>, <span class="fu">nrow</span>(df_trends_raw), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Rows:            7400</code></pre>
-<div class="sourceCode" id="cb35"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb35-1"><a href="#cb35-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Unique players: &quot;</span>, <span class="fu">n_distinct</span>(df_trends_raw<span class="sc">$</span>player), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Unique players:  1184</code></pre>
-<div class="sourceCode" id="cb37"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb37-1"><a href="#cb37-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Year range:     &quot;</span>, <span class="fu">min</span>(df_trends_raw<span class="sc">$</span>year), <span class="st">&quot;–&quot;</span>, <span class="fu">max</span>(df_trends_raw<span class="sc">$</span>year), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Year range:      1987 – 2025</code></pre>
-<div class="sourceCode" id="cb39"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb39-1"><a href="#cb39-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;</span><span class="sc">\n</span><span class="st">NA counts:</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## 
-## NA counts:</code></pre>
-<div class="sourceCode" id="cb41"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb41-1"><a href="#cb41-1" tabindex="-1"></a>df_trends_raw <span class="sc">%&gt;%</span></span>
-<span id="cb41-2"><a href="#cb41-2" tabindex="-1"></a>  <span class="fu">summarise</span>(<span class="fu">across</span>(<span class="fu">everything</span>(), <span class="sc">~</span><span class="fu">sum</span>(<span class="fu">is.na</span>(.)))) <span class="sc">%&gt;%</span></span>
-<span id="cb41-3"><a href="#cb41-3" tabindex="-1"></a>  <span class="fu">pivot_longer</span>(<span class="fu">everything</span>(), <span class="at">names_to =</span> <span class="st">&quot;column&quot;</span>, <span class="at">values_to =</span> <span class="st">&quot;n_missing&quot;</span>) <span class="sc">%&gt;%</span></span>
-<span id="cb41-4"><a href="#cb41-4" tabindex="-1"></a>  <span class="fu">filter</span>(n_missing <span class="sc">&gt;</span> <span class="dv">0</span>) <span class="sc">%&gt;%</span></span>
-<span id="cb41-5"><a href="#cb41-5" tabindex="-1"></a>  <span class="fu">print</span>()</span></code></pre></div>
-<pre><code>## # A tibble: 0 × 2
-## # ℹ 2 variables: column &lt;chr&gt;, n_missing &lt;int&gt;</code></pre>
-<div class="sourceCode" id="cb43"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb43-1"><a href="#cb43-1" tabindex="-1"></a>df_trends_raw <span class="sc">%&gt;%</span></span>
-<span id="cb43-2"><a href="#cb43-2" tabindex="-1"></a>  <span class="fu">summarise</span>(</span>
-<span id="cb43-3"><a href="#cb43-3" tabindex="-1"></a>    <span class="at">accuracy_out_of_range =</span> <span class="fu">sum</span>(accuracy <span class="sc">&lt;</span> <span class="dv">0</span> <span class="sc">|</span> accuracy <span class="sc">&gt;</span> <span class="dv">100</span>, <span class="at">na.rm =</span> <span class="cn">TRUE</span>),</span>
-<span id="cb43-4"><a href="#cb43-4" tabindex="-1"></a>    <span class="at">distance_out_of_range =</span> <span class="fu">sum</span>(distance <span class="sc">&lt;</span> <span class="dv">200</span> <span class="sc">|</span> distance <span class="sc">&gt;</span> <span class="dv">350</span>, <span class="at">na.rm =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb43-5"><a href="#cb43-5" tabindex="-1"></a>  ) <span class="sc">%&gt;%</span></span>
-<span id="cb43-6"><a href="#cb43-6" tabindex="-1"></a>  <span class="fu">print</span>()</span></code></pre></div>
-<pre><code>## # A tibble: 1 × 2
-##   accuracy_out_of_range distance_out_of_range
-##                   &lt;int&gt;                 &lt;int&gt;
-## 1                     0                     0</code></pre>
+<div id="spot-check-arjun-atwal" class="section level2">
+<h2>3.2 Spot check — Arjun Atwal</h2>
+<p>Known pattern: seasons 2004–2006, 2011–2012, 2020 (two multi-year
+gaps, including a 7-year gap before returning in 2020).</p>
+<div class="sourceCode" id="cb17"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb17-1"><a href="#cb17-1" tabindex="-1"></a>spell_summary <span class="sc">%&gt;%</span></span>
+<span id="cb17-2"><a href="#cb17-2" tabindex="-1"></a>  <span class="fu">filter</span>(player_name <span class="sc">==</span> <span class="st">&quot;Arjun Atwal&quot;</span>) <span class="sc">%&gt;%</span></span>
+<span id="cb17-3"><a href="#cb17-3" tabindex="-1"></a>  <span class="fu">print</span>()</span></code></pre></div>
+<pre><code>## # A tibble: 3 × 8
+##   player_name spell_id spell_start_year spell_end_year gap_before gap_after
+##   &lt;chr&gt;          &lt;dbl&gt;            &lt;int&gt;          &lt;int&gt;      &lt;dbl&gt;     &lt;dbl&gt;
+## 1 Arjun Atwal        1             2004           2006         NA         4
+## 2 Arjun Atwal        2             2011           2012          4         7
+## 3 Arjun Atwal        3             2020           2020          7        NA
+## # ℹ 2 more variables: is_final_spell &lt;lgl&gt;, final_gap_length &lt;int&gt;</code></pre>
 <hr />
 </div>
 </div>
-<div id="clean-df_complete" class="section level1">
-<h1>3. Clean df_complete</h1>
-<div id="column-names-and-types" class="section level2">
-<h2>3.1 Column names and types</h2>
-<div class="sourceCode" id="cb45"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb45-1"><a href="#cb45-1" tabindex="-1"></a>df_clean <span class="ot">&lt;-</span> df_raw <span class="sc">%&gt;%</span></span>
-<span id="cb45-2"><a href="#cb45-2" tabindex="-1"></a>  <span class="co"># Fix column name with space</span></span>
-<span id="cb45-3"><a href="#cb45-3" tabindex="-1"></a>  <span class="fu">rename</span>(<span class="at">rookie_year =</span> <span class="st">`</span><span class="at">rookie year</span><span class="st">`</span>) <span class="sc">%&gt;%</span></span>
-<span id="cb45-4"><a href="#cb45-4" tabindex="-1"></a>  <span class="co"># Ensure player_name is character, year is integer</span></span>
-<span id="cb45-5"><a href="#cb45-5" tabindex="-1"></a>  <span class="fu">mutate</span>(</span>
-<span id="cb45-6"><a href="#cb45-6" tabindex="-1"></a>    <span class="at">player_name =</span> <span class="fu">as.character</span>(player_name),</span>
-<span id="cb45-7"><a href="#cb45-7" tabindex="-1"></a>    <span class="at">year        =</span> <span class="fu">as.integer</span>(year)</span>
-<span id="cb45-8"><a href="#cb45-8" tabindex="-1"></a>  )</span>
-<span id="cb45-9"><a href="#cb45-9" tabindex="-1"></a></span>
-<span id="cb45-10"><a href="#cb45-10" tabindex="-1"></a><span class="co"># Confirm rename worked</span></span>
-<span id="cb45-11"><a href="#cb45-11" tabindex="-1"></a><span class="fu">names</span>(df_clean)</span></code></pre></div>
-<pre><code>##  [1] &quot;player_name&quot;    &quot;year&quot;           &quot;accuracy&quot;       &quot;ball_speed&quot;    
-##  [5] &quot;carry_distance&quot; &quot;chs&quot;            &quot;distance&quot;       &quot;sg_putt&quot;       
-##  [9] &quot;sg_ttg&quot;         &quot;sg_ott&quot;         &quot;sg_apr&quot;         &quot;sg_arg&quot;        
-## [13] &quot;sg_total&quot;       &quot;birth_year&quot;     &quot;turned_pro&quot;     &quot;rookie_year&quot;   
-## [17] &quot;age&quot;</code></pre>
-</div>
-<div id="handle-the-pre-2007-speed-data-gap" class="section level2">
-<h2>3.2 Handle the pre-2007 speed data gap</h2>
-<p>Ball speed, CHS, and carry distance have ~594 NAs concentrated in
-2004–2006, before these metrics were tracked by ShotLink. We do not
-impute these values. Instead we document the gap and note the effective
-start year for speed analyses.</p>
-<div class="sourceCode" id="cb47"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb47-1"><a href="#cb47-1" tabindex="-1"></a>df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb47-2"><a href="#cb47-2" tabindex="-1"></a>  <span class="fu">group_by</span>(year) <span class="sc">%&gt;%</span></span>
-<span id="cb47-3"><a href="#cb47-3" tabindex="-1"></a>  <span class="fu">summarise</span>(</span>
-<span id="cb47-4"><a href="#cb47-4" tabindex="-1"></a>    <span class="at">n             =</span> <span class="fu">n</span>(),</span>
-<span id="cb47-5"><a href="#cb47-5" tabindex="-1"></a>    <span class="at">na_ball_speed =</span> <span class="fu">sum</span>(<span class="fu">is.na</span>(ball_speed)),</span>
-<span id="cb47-6"><a href="#cb47-6" tabindex="-1"></a>    <span class="at">na_chs        =</span> <span class="fu">sum</span>(<span class="fu">is.na</span>(chs)),</span>
-<span id="cb47-7"><a href="#cb47-7" tabindex="-1"></a>    <span class="at">na_carry      =</span> <span class="fu">sum</span>(<span class="fu">is.na</span>(carry_distance))</span>
-<span id="cb47-8"><a href="#cb47-8" tabindex="-1"></a>  ) <span class="sc">%&gt;%</span></span>
-<span id="cb47-9"><a href="#cb47-9" tabindex="-1"></a>  <span class="fu">filter</span>(na_ball_speed <span class="sc">&gt;</span> <span class="dv">0</span>) <span class="sc">%&gt;%</span></span>
-<span id="cb47-10"><a href="#cb47-10" tabindex="-1"></a>  <span class="fu">print</span>()</span></code></pre></div>
-<pre><code>## # A tibble: 3 × 5
-##    year     n na_ball_speed na_chs na_carry
-##   &lt;int&gt; &lt;int&gt;         &lt;int&gt;  &lt;int&gt;    &lt;int&gt;
-## 1  2004   196           196    196      196
-## 2  2005   202           202    202      202
-## 3  2006   196           196    196      196</code></pre>
-<p>The <code>SPEED_ERA_START</code> constant in <code>config.R</code> is
-set to <code>2007</code>. Any analysis involving ball speed or CHS
-should filter to <code>year &gt;= SPEED_ERA_START</code>.</p>
-</div>
-<div id="b-missing-rookie_year-turned_pro" class="section level2">
-<h2>3.2b Missing rookie_year / turned_pro</h2>
-<p><code>turned_pro</code> is a weak proxy for PGA Tour entry regardless
-of missingness: checked directly against the data, the median gap
-between turning pro and a player’s first PGA Tour season is 7 years, and
-62% of players have a gap greater than 5 years (grinding through other
-tours first). Combined with <code>rookie_year</code>’s incompleteness
-below, neither field is used as the basis for any engineered variable in
-this notebook — <code>years_on_tour</code> and <code>entry_cohort</code>
-are instead built from the cross-referenced <code>entry_year</code>
-(section 3.4). <code>rookie_year</code>/<code>turned_pro</code> are kept
-as raw columns for reference only.</p>
-<div class="sourceCode" id="cb49"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb49-1"><a href="#cb49-1" tabindex="-1"></a>missing_rookie_year <span class="ot">&lt;-</span> df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb49-2"><a href="#cb49-2" tabindex="-1"></a>  <span class="fu">filter</span>(<span class="fu">is.na</span>(rookie_year))</span>
-<span id="cb49-3"><a href="#cb49-3" tabindex="-1"></a></span>
-<span id="cb49-4"><a href="#cb49-4" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Rows missing rookie_year:   &quot;</span>, <span class="fu">nrow</span>(missing_rookie_year), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Rows missing rookie_year:    79</code></pre>
-<div class="sourceCode" id="cb51"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb51-1"><a href="#cb51-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Players missing rookie_year:&quot;</span>, <span class="fu">n_distinct</span>(missing_rookie_year<span class="sc">$</span>player_name), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Players missing rookie_year: 28</code></pre>
-<div class="sourceCode" id="cb53"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb53-1"><a href="#cb53-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Rows missing turned_pro:    &quot;</span>, <span class="fu">sum</span>(<span class="fu">is.na</span>(df_clean<span class="sc">$</span>turned_pro)), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Rows missing turned_pro:     1</code></pre>
-</div>
-<div id="minimum-seasons-filter" class="section level2">
-<h2>3.3 Minimum seasons filter</h2>
-<p>Players appearing in fewer than <code>MIN_SEASONS</code> (2) seasons
-are excluded from longitudinal analyses. We flag rather than drop them
-here, preserving the option to include single-season players in purely
-cross-sectional work.</p>
-<div class="sourceCode" id="cb55"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb55-1"><a href="#cb55-1" tabindex="-1"></a>seasons_per_player <span class="ot">&lt;-</span> df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb55-2"><a href="#cb55-2" tabindex="-1"></a>  <span class="fu">count</span>(player_name, <span class="at">name =</span> <span class="st">&quot;n_seasons&quot;</span>)</span>
-<span id="cb55-3"><a href="#cb55-3" tabindex="-1"></a></span>
-<span id="cb55-4"><a href="#cb55-4" tabindex="-1"></a>df_clean <span class="ot">&lt;-</span> df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb55-5"><a href="#cb55-5" tabindex="-1"></a>  <span class="fu">left_join</span>(seasons_per_player, <span class="at">by =</span> <span class="st">&quot;player_name&quot;</span>) <span class="sc">%&gt;%</span></span>
-<span id="cb55-6"><a href="#cb55-6" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">multi_season =</span> n_seasons <span class="sc">&gt;=</span> MIN_SEASONS)</span>
-<span id="cb55-7"><a href="#cb55-7" tabindex="-1"></a></span>
-<span id="cb55-8"><a href="#cb55-8" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Players with 1 season only: &quot;</span>,</span>
-<span id="cb55-9"><a href="#cb55-9" tabindex="-1"></a>    <span class="fu">sum</span>(seasons_per_player<span class="sc">$</span>n_seasons <span class="sc">&lt;</span> MIN_SEASONS), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Players with 1 season only:  197</code></pre>
-<div class="sourceCode" id="cb57"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb57-1"><a href="#cb57-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Players with 2+ seasons:    &quot;</span>,</span>
-<span id="cb57-2"><a href="#cb57-2" tabindex="-1"></a>    <span class="fu">sum</span>(seasons_per_player<span class="sc">$</span>n_seasons <span class="sc">&gt;=</span> MIN_SEASONS), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Players with 2+ seasons:     596</code></pre>
-</div>
-<div id="true-entry-year-cross-referenced-with-trends-data" class="section level2">
-<h2>3.4 True entry year (cross-referenced with trends data)</h2>
-<p><code>df_complete</code> only covers the strokes-gained era (2004+),
-so a player’s first row here isn’t necessarily their true PGA Tour debut
-— some players were already playing for years beforehand.
-<code>trends_acc_dist_1987_to_2025.csv</code> carries simpler stats
-(distance/accuracy only, no strokes-gained) but goes back to 1987, so we
-take the earliest year found in <em>either</em> source as the best
-available estimate of a player’s true tour entry.</p>
-<div class="sourceCode" id="cb59"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb59-1"><a href="#cb59-1" tabindex="-1"></a>first_year_complete <span class="ot">&lt;-</span> df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb59-2"><a href="#cb59-2" tabindex="-1"></a>  <span class="fu">group_by</span>(player_name) <span class="sc">%&gt;%</span></span>
-<span id="cb59-3"><a href="#cb59-3" tabindex="-1"></a>  <span class="fu">summarise</span>(<span class="at">first_year_complete =</span> <span class="fu">min</span>(year), <span class="at">.groups =</span> <span class="st">&quot;drop&quot;</span>)</span>
-<span id="cb59-4"><a href="#cb59-4" tabindex="-1"></a></span>
-<span id="cb59-5"><a href="#cb59-5" tabindex="-1"></a>first_year_trends <span class="ot">&lt;-</span> df_trends_raw <span class="sc">%&gt;%</span></span>
-<span id="cb59-6"><a href="#cb59-6" tabindex="-1"></a>  <span class="fu">rename</span>(<span class="at">player_name =</span> player) <span class="sc">%&gt;%</span></span>
-<span id="cb59-7"><a href="#cb59-7" tabindex="-1"></a>  <span class="fu">group_by</span>(player_name) <span class="sc">%&gt;%</span></span>
-<span id="cb59-8"><a href="#cb59-8" tabindex="-1"></a>  <span class="fu">summarise</span>(<span class="at">first_year_trends =</span> <span class="fu">min</span>(year), <span class="at">.groups =</span> <span class="st">&quot;drop&quot;</span>)</span>
-<span id="cb59-9"><a href="#cb59-9" tabindex="-1"></a></span>
-<span id="cb59-10"><a href="#cb59-10" tabindex="-1"></a>TRENDS_START_YEAR <span class="ot">&lt;-</span> <span class="fu">min</span>(df_trends_raw<span class="sc">$</span>year)</span>
-<span id="cb59-11"><a href="#cb59-11" tabindex="-1"></a></span>
-<span id="cb59-12"><a href="#cb59-12" tabindex="-1"></a>entry_year_lookup <span class="ot">&lt;-</span> first_year_complete <span class="sc">%&gt;%</span></span>
-<span id="cb59-13"><a href="#cb59-13" tabindex="-1"></a>  <span class="fu">left_join</span>(first_year_trends, <span class="at">by =</span> <span class="st">&quot;player_name&quot;</span>) <span class="sc">%&gt;%</span></span>
-<span id="cb59-14"><a href="#cb59-14" tabindex="-1"></a>  <span class="fu">mutate</span>(</span>
-<span id="cb59-15"><a href="#cb59-15" tabindex="-1"></a>    <span class="at">entry_year     =</span> <span class="fu">pmin</span>(first_year_complete, first_year_trends, <span class="at">na.rm =</span> <span class="cn">TRUE</span>),</span>
-<span id="cb59-16"><a href="#cb59-16" tabindex="-1"></a>    <span class="at">left_truncated =</span> entry_year <span class="sc">==</span> TRENDS_START_YEAR</span>
-<span id="cb59-17"><a href="#cb59-17" tabindex="-1"></a>  ) <span class="sc">%&gt;%</span></span>
-<span id="cb59-18"><a href="#cb59-18" tabindex="-1"></a>  <span class="fu">select</span>(player_name, entry_year, left_truncated)</span>
-<span id="cb59-19"><a href="#cb59-19" tabindex="-1"></a></span>
-<span id="cb59-20"><a href="#cb59-20" tabindex="-1"></a>df_clean <span class="ot">&lt;-</span> df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb59-21"><a href="#cb59-21" tabindex="-1"></a>  <span class="fu">left_join</span>(entry_year_lookup, <span class="at">by =</span> <span class="st">&quot;player_name&quot;</span>)</span>
-<span id="cb59-22"><a href="#cb59-22" tabindex="-1"></a></span>
-<span id="cb59-23"><a href="#cb59-23" tabindex="-1"></a>recovered <span class="ot">&lt;-</span> first_year_complete <span class="sc">%&gt;%</span></span>
-<span id="cb59-24"><a href="#cb59-24" tabindex="-1"></a>  <span class="fu">left_join</span>(first_year_trends, <span class="at">by =</span> <span class="st">&quot;player_name&quot;</span>) <span class="sc">%&gt;%</span></span>
-<span id="cb59-25"><a href="#cb59-25" tabindex="-1"></a>  <span class="fu">filter</span>(<span class="sc">!</span><span class="fu">is.na</span>(first_year_trends) <span class="sc">&amp;</span> first_year_trends <span class="sc">&lt;</span> first_year_complete)</span>
-<span id="cb59-26"><a href="#cb59-26" tabindex="-1"></a></span>
-<span id="cb59-27"><a href="#cb59-27" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Players with entry_year recovered earlier via trends file:&quot;</span>, <span class="fu">nrow</span>(recovered), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Players with entry_year recovered earlier via trends file: 218</code></pre>
-<div class="sourceCode" id="cb61"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb61-1"><a href="#cb61-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Players left_truncated (entry_year == trends file start,&quot;</span>, TRENDS_START_YEAR, <span class="st">&quot;):&quot;</span>,</span>
-<span id="cb61-2"><a href="#cb61-2" tabindex="-1"></a>    <span class="fu">sum</span>(entry_year_lookup<span class="sc">$</span>left_truncated), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Players left_truncated (entry_year == trends file start, 1987 ): 38</code></pre>
-<p>Spot check a few recovered players against known PGA Tour debuts:</p>
-<div class="sourceCode" id="cb63"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb63-1"><a href="#cb63-1" tabindex="-1"></a>recovered <span class="sc">%&gt;%</span></span>
-<span id="cb63-2"><a href="#cb63-2" tabindex="-1"></a>  <span class="fu">left_join</span>(entry_year_lookup, <span class="at">by =</span> <span class="st">&quot;player_name&quot;</span>) <span class="sc">%&gt;%</span></span>
-<span id="cb63-3"><a href="#cb63-3" tabindex="-1"></a>  <span class="fu">arrange</span>(entry_year) <span class="sc">%&gt;%</span></span>
-<span id="cb63-4"><a href="#cb63-4" tabindex="-1"></a>  <span class="fu">select</span>(player_name, first_year_complete, entry_year) <span class="sc">%&gt;%</span></span>
-<span id="cb63-5"><a href="#cb63-5" tabindex="-1"></a>  <span class="fu">head</span>(<span class="dv">10</span>) <span class="sc">%&gt;%</span></span>
-<span id="cb63-6"><a href="#cb63-6" tabindex="-1"></a>  <span class="fu">print</span>()</span></code></pre></div>
-<pre><code>## # A tibble: 10 × 3
-##    player_name        first_year_complete entry_year
-##    &lt;chr&gt;                            &lt;int&gt;      &lt;dbl&gt;
-##  1 Andrew Magee                      2005       1987
-##  2 Bernhard Langer                   2004       1987
-##  3 Bill Glasson                      2005       1987
-##  4 Blaine McCallister                2004       1987
-##  5 Bob Tway                          2004       1987
-##  6 Brad Faxon                        2004       1987
-##  7 Corey Pavin                       2004       1987
-##  8 Dan Forsman                       2004       1987
-##  9 David Frost                       2004       1987
-## 10 David Peoples                     2004       1987</code></pre>
+<div id="build-survival-dataset" class="section level1">
+<h1>4. Build Survival Dataset</h1>
+<p>Join spell structure back onto each player-year row, and add the
+start-stop time axis (<code>time_start</code>/<code>time_stop</code>)
+using calendar tenure from the cross-referenced <code>entry_year</code>
+(not <code>rookie_year</code> — see <code>00_data_engineering.Rmd</code>
+sections 3.2b/3.4/4.1 for why).</p>
+<div class="sourceCode" id="cb19"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb19-1"><a href="#cb19-1" tabindex="-1"></a>spells_with_id <span class="ot">&lt;-</span> spells <span class="sc">%&gt;%</span> <span class="fu">select</span>(player_name, year, spell_id)</span>
+<span id="cb19-2"><a href="#cb19-2" tabindex="-1"></a></span>
+<span id="cb19-3"><a href="#cb19-3" tabindex="-1"></a>df_survival <span class="ot">&lt;-</span> df_main <span class="sc">%&gt;%</span></span>
+<span id="cb19-4"><a href="#cb19-4" tabindex="-1"></a>  <span class="fu">left_join</span>(spells_with_id, <span class="at">by =</span> <span class="fu">c</span>(<span class="st">&quot;player_name&quot;</span>, <span class="st">&quot;year&quot;</span>)) <span class="sc">%&gt;%</span></span>
+<span id="cb19-5"><a href="#cb19-5" tabindex="-1"></a>  <span class="fu">left_join</span>(spell_summary, <span class="at">by =</span> <span class="fu">c</span>(<span class="st">&quot;player_name&quot;</span>, <span class="st">&quot;spell_id&quot;</span>)) <span class="sc">%&gt;%</span></span>
+<span id="cb19-6"><a href="#cb19-6" tabindex="-1"></a>  <span class="fu">mutate</span>(</span>
+<span id="cb19-7"><a href="#cb19-7" tabindex="-1"></a>    <span class="at">time_start =</span> year <span class="sc">-</span> entry_year,</span>
+<span id="cb19-8"><a href="#cb19-8" tabindex="-1"></a>    <span class="at">time_stop  =</span> time_start <span class="sc">+</span> <span class="dv">1</span></span>
+<span id="cb19-9"><a href="#cb19-9" tabindex="-1"></a>  ) <span class="sc">%&gt;%</span></span>
+<span id="cb19-10"><a href="#cb19-10" tabindex="-1"></a>  <span class="fu">select</span>(</span>
+<span id="cb19-11"><a href="#cb19-11" tabindex="-1"></a>    player_name, year, entry_year, left_truncated, entry_cohort,</span>
+<span id="cb19-12"><a href="#cb19-12" tabindex="-1"></a>    spell_id, spell_start_year, spell_end_year,</span>
+<span id="cb19-13"><a href="#cb19-13" tabindex="-1"></a>    gap_before, gap_after, is_final_spell, final_gap_length,</span>
+<span id="cb19-14"><a href="#cb19-14" tabindex="-1"></a>    time_start, time_stop,</span>
+<span id="cb19-15"><a href="#cb19-15" tabindex="-1"></a>    dist_entry_quartile, dist_vs_field, sg_total, age</span>
+<span id="cb19-16"><a href="#cb19-16" tabindex="-1"></a>  )</span>
+<span id="cb19-17"><a href="#cb19-17" tabindex="-1"></a></span>
+<span id="cb19-18"><a href="#cb19-18" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Rows in df_survival:&quot;</span>, <span class="fu">nrow</span>(df_survival), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
+<pre><code>## Rows in df_survival: 4175</code></pre>
+<div class="sourceCode" id="cb21"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb21-1"><a href="#cb21-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Rows in df_main:    &quot;</span>, <span class="fu">nrow</span>(df_main), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
+<pre><code>## Rows in df_main:     4175</code></pre>
+<div class="sourceCode" id="cb23"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb23-1"><a href="#cb23-1" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="fu">nrow</span>(df_survival) <span class="sc">==</span> <span class="fu">nrow</span>(df_main))</span></code></pre></div>
 <hr />
-</div>
-</div>
-<div id="engineer-variables-df_complete" class="section level1">
-<h1>4. Engineer Variables — df_complete</h1>
-<div id="career-tenure-and-cohort-variables" class="section level2">
-<h2>4.1 Career tenure and cohort variables</h2>
-<p><code>entry_year</code> (section 3.4) is the true, cross-referenced
-tour-debut year and is the right time origin for tenure.
-<code>cohort</code> is split into two purpose-built variables rather
-than one: <code>entry_cohort</code> (decade of tour entry) is the right
-lens for career-stage/tenure questions (survival analysis, time-to-
-obsolescence); <code>birth_cohort</code> (decade of birth) isolates
-generational effects (equipment/training exposure by birth era) without
-conflating a young rookie with a late-blooming veteran who happened to
-enter the tour in the same decade.</p>
-<div class="sourceCode" id="cb65"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb65-1"><a href="#cb65-1" tabindex="-1"></a>df_clean <span class="ot">&lt;-</span> df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb65-2"><a href="#cb65-2" tabindex="-1"></a>  <span class="fu">mutate</span>(</span>
-<span id="cb65-3"><a href="#cb65-3" tabindex="-1"></a>    <span class="co"># Tenure on tour, from the cross-referenced true entry year</span></span>
-<span id="cb65-4"><a href="#cb65-4" tabindex="-1"></a>    <span class="at">years_on_tour =</span> year <span class="sc">-</span> entry_year,</span>
-<span id="cb65-5"><a href="#cb65-5" tabindex="-1"></a></span>
-<span id="cb65-6"><a href="#cb65-6" tabindex="-1"></a>    <span class="co"># Entry cohort: decade of true tour entry (career-stage lens)</span></span>
-<span id="cb65-7"><a href="#cb65-7" tabindex="-1"></a>    <span class="at">entry_cohort =</span> <span class="fu">case_when</span>(</span>
-<span id="cb65-8"><a href="#cb65-8" tabindex="-1"></a>      entry_year <span class="sc">&lt;</span> <span class="dv">2000</span>                      <span class="sc">~</span> <span class="st">&quot;pre-2000&quot;</span>,</span>
-<span id="cb65-9"><a href="#cb65-9" tabindex="-1"></a>      entry_year <span class="sc">&gt;=</span> <span class="dv">2000</span> <span class="sc">&amp;</span> entry_year <span class="sc">&lt;</span> <span class="dv">2010</span>  <span class="sc">~</span> <span class="st">&quot;2000–2009&quot;</span>,</span>
-<span id="cb65-10"><a href="#cb65-10" tabindex="-1"></a>      entry_year <span class="sc">&gt;=</span> <span class="dv">2010</span> <span class="sc">&amp;</span> entry_year <span class="sc">&lt;</span> <span class="dv">2020</span>  <span class="sc">~</span> <span class="st">&quot;2010–2019&quot;</span>,</span>
-<span id="cb65-11"><a href="#cb65-11" tabindex="-1"></a>      entry_year <span class="sc">&gt;=</span> <span class="dv">2020</span>                      <span class="sc">~</span> <span class="st">&quot;2020+&quot;</span>,</span>
-<span id="cb65-12"><a href="#cb65-12" tabindex="-1"></a>      <span class="cn">TRUE</span>                                    <span class="sc">~</span> <span class="cn">NA_character_</span></span>
-<span id="cb65-13"><a href="#cb65-13" tabindex="-1"></a>    ) <span class="sc">%&gt;%</span> <span class="fu">factor</span>(<span class="at">levels =</span> <span class="fu">c</span>(<span class="st">&quot;pre-2000&quot;</span>, <span class="st">&quot;2000–2009&quot;</span>, <span class="st">&quot;2010–2019&quot;</span>, <span class="st">&quot;2020+&quot;</span>)),</span>
-<span id="cb65-14"><a href="#cb65-14" tabindex="-1"></a></span>
-<span id="cb65-15"><a href="#cb65-15" tabindex="-1"></a>    <span class="co"># Birth cohort: decade of birth (generational lens)</span></span>
-<span id="cb65-16"><a href="#cb65-16" tabindex="-1"></a>    <span class="at">birth_cohort =</span> <span class="fu">case_when</span>(</span>
-<span id="cb65-17"><a href="#cb65-17" tabindex="-1"></a>      birth_year <span class="sc">&lt;</span> <span class="dv">1970</span>                     <span class="sc">~</span> <span class="st">&quot;Pre-1970&quot;</span>,</span>
-<span id="cb65-18"><a href="#cb65-18" tabindex="-1"></a>      birth_year <span class="sc">&gt;=</span> <span class="dv">1970</span> <span class="sc">&amp;</span> birth_year <span class="sc">&lt;</span> <span class="dv">1980</span> <span class="sc">~</span> <span class="st">&quot;1970s&quot;</span>,</span>
-<span id="cb65-19"><a href="#cb65-19" tabindex="-1"></a>      birth_year <span class="sc">&gt;=</span> <span class="dv">1980</span> <span class="sc">&amp;</span> birth_year <span class="sc">&lt;</span> <span class="dv">1990</span> <span class="sc">~</span> <span class="st">&quot;1980s&quot;</span>,</span>
-<span id="cb65-20"><a href="#cb65-20" tabindex="-1"></a>      birth_year <span class="sc">&gt;=</span> <span class="dv">1990</span> <span class="sc">&amp;</span> birth_year <span class="sc">&lt;</span> <span class="dv">2000</span> <span class="sc">~</span> <span class="st">&quot;1990s&quot;</span>,</span>
-<span id="cb65-21"><a href="#cb65-21" tabindex="-1"></a>      birth_year <span class="sc">&gt;=</span> <span class="dv">2000</span>                     <span class="sc">~</span> <span class="st">&quot;2000s+&quot;</span>,</span>
-<span id="cb65-22"><a href="#cb65-22" tabindex="-1"></a>      <span class="cn">TRUE</span>                                   <span class="sc">~</span> <span class="cn">NA_character_</span></span>
-<span id="cb65-23"><a href="#cb65-23" tabindex="-1"></a>    ) <span class="sc">%&gt;%</span> <span class="fu">factor</span>(<span class="at">levels =</span> <span class="fu">c</span>(<span class="st">&quot;Pre-1970&quot;</span>, <span class="st">&quot;1970s&quot;</span>, <span class="st">&quot;1980s&quot;</span>, <span class="st">&quot;1990s&quot;</span>, <span class="st">&quot;2000s+&quot;</span>))</span>
-<span id="cb65-24"><a href="#cb65-24" tabindex="-1"></a>  )</span>
-<span id="cb65-25"><a href="#cb65-25" tabindex="-1"></a></span>
-<span id="cb65-26"><a href="#cb65-26" tabindex="-1"></a>df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb65-27"><a href="#cb65-27" tabindex="-1"></a>  <span class="fu">count</span>(entry_cohort) <span class="sc">%&gt;%</span></span>
-<span id="cb65-28"><a href="#cb65-28" tabindex="-1"></a>  <span class="fu">print</span>()</span></code></pre></div>
-<pre><code>## # A tibble: 4 × 2
-##   entry_cohort     n
-##   &lt;fct&gt;        &lt;int&gt;
-## 1 pre-2000       773
-## 2 2000–2009     1602
-## 3 2010–2019     1426
-## 4 2020+          374</code></pre>
-<div class="sourceCode" id="cb67"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb67-1"><a href="#cb67-1" tabindex="-1"></a>df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb67-2"><a href="#cb67-2" tabindex="-1"></a>  <span class="fu">count</span>(birth_cohort) <span class="sc">%&gt;%</span></span>
-<span id="cb67-3"><a href="#cb67-3" tabindex="-1"></a>  <span class="fu">print</span>()</span></code></pre></div>
-<pre><code>## # A tibble: 5 × 2
-##   birth_cohort     n
-##   &lt;fct&gt;        &lt;int&gt;
-## 1 Pre-1970       641
-## 2 1970s         1288
-## 3 1980s         1418
-## 4 1990s          803
-## 5 2000s+          25</code></pre>
-</div>
-<div id="field-relative-metrics-within-year-centering" class="section level2">
-<h2>4.2 Field-relative metrics (within-year centering)</h2>
-<p>These express each player’s stats relative to the season average —
-removing the secular trend so we can compare players across eras.</p>
-<div class="sourceCode" id="cb69"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb69-1"><a href="#cb69-1" tabindex="-1"></a>df_clean <span class="ot">&lt;-</span> df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb69-2"><a href="#cb69-2" tabindex="-1"></a>  <span class="fu">group_by</span>(year) <span class="sc">%&gt;%</span></span>
-<span id="cb69-3"><a href="#cb69-3" tabindex="-1"></a>  <span class="fu">mutate</span>(</span>
-<span id="cb69-4"><a href="#cb69-4" tabindex="-1"></a>    <span class="at">dist_vs_field  =</span> distance   <span class="sc">-</span> <span class="fu">mean</span>(distance,   <span class="at">na.rm =</span> <span class="cn">TRUE</span>),</span>
-<span id="cb69-5"><a href="#cb69-5" tabindex="-1"></a>    <span class="at">acc_vs_field   =</span> accuracy   <span class="sc">-</span> <span class="fu">mean</span>(accuracy,   <span class="at">na.rm =</span> <span class="cn">TRUE</span>),</span>
-<span id="cb69-6"><a href="#cb69-6" tabindex="-1"></a>    <span class="at">speed_vs_field =</span> ball_speed <span class="sc">-</span> <span class="fu">mean</span>(ball_speed, <span class="at">na.rm =</span> <span class="cn">TRUE</span>),</span>
-<span id="cb69-7"><a href="#cb69-7" tabindex="-1"></a>    <span class="at">chs_vs_field   =</span> chs        <span class="sc">-</span> <span class="fu">mean</span>(chs,        <span class="at">na.rm =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb69-8"><a href="#cb69-8" tabindex="-1"></a>  ) <span class="sc">%&gt;%</span></span>
-<span id="cb69-9"><a href="#cb69-9" tabindex="-1"></a>  <span class="fu">ungroup</span>()</span></code></pre></div>
-</div>
-<div id="mundlak-decomposition-variables" class="section level2">
-<h2>4.3 Mundlak decomposition variables</h2>
-<p>The Mundlak approach separates the <em>between-player</em> effect of
-distance (do longer hitters systematically differ from shorter hitters?)
-from the <em>within-player</em> effect (does a player improve when their
-own distance increases?). This is critical for correctly interpreting
-panel models.</p>
-<div class="sourceCode" id="cb70"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb70-1"><a href="#cb70-1" tabindex="-1"></a>df_clean <span class="ot">&lt;-</span> df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb70-2"><a href="#cb70-2" tabindex="-1"></a>  <span class="fu">group_by</span>(player_name) <span class="sc">%&gt;%</span></span>
-<span id="cb70-3"><a href="#cb70-3" tabindex="-1"></a>  <span class="fu">mutate</span>(</span>
-<span id="cb70-4"><a href="#cb70-4" tabindex="-1"></a>    <span class="co"># Career-average distance for each player (between-player component)</span></span>
-<span id="cb70-5"><a href="#cb70-5" tabindex="-1"></a>    <span class="at">dist_player_mean =</span> <span class="fu">mean</span>(distance, <span class="at">na.rm =</span> <span class="cn">TRUE</span>),</span>
-<span id="cb70-6"><a href="#cb70-6" tabindex="-1"></a></span>
-<span id="cb70-7"><a href="#cb70-7" tabindex="-1"></a>    <span class="co"># Deviation from own career average (within-player component)</span></span>
-<span id="cb70-8"><a href="#cb70-8" tabindex="-1"></a>    <span class="at">dist_within =</span> distance <span class="sc">-</span> dist_player_mean</span>
-<span id="cb70-9"><a href="#cb70-9" tabindex="-1"></a>  ) <span class="sc">%&gt;%</span></span>
-<span id="cb70-10"><a href="#cb70-10" tabindex="-1"></a>  <span class="fu">ungroup</span>()</span></code></pre></div>
-</div>
-<div id="distance-quintiles-within-each-year" class="section level2">
-<h2>4.4 Distance quintiles (within each year)</h2>
-<p>Players ranked into five equal groups within each season. Q1 =
-shortest, Q5 = longest.</p>
-<div class="sourceCode" id="cb71"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb71-1"><a href="#cb71-1" tabindex="-1"></a>df_clean <span class="ot">&lt;-</span> df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb71-2"><a href="#cb71-2" tabindex="-1"></a>  <span class="fu">group_by</span>(year) <span class="sc">%&gt;%</span></span>
-<span id="cb71-3"><a href="#cb71-3" tabindex="-1"></a>  <span class="fu">mutate</span>(</span>
-<span id="cb71-4"><a href="#cb71-4" tabindex="-1"></a>    <span class="at">dist_quintile =</span> <span class="fu">ntile</span>(distance, <span class="dv">5</span>)</span>
-<span id="cb71-5"><a href="#cb71-5" tabindex="-1"></a>  ) <span class="sc">%&gt;%</span></span>
-<span id="cb71-6"><a href="#cb71-6" tabindex="-1"></a>  <span class="fu">ungroup</span>()</span>
-<span id="cb71-7"><a href="#cb71-7" tabindex="-1"></a></span>
-<span id="cb71-8"><a href="#cb71-8" tabindex="-1"></a><span class="co"># Verify distribution is roughly even</span></span>
-<span id="cb71-9"><a href="#cb71-9" tabindex="-1"></a>df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb71-10"><a href="#cb71-10" tabindex="-1"></a>  <span class="fu">count</span>(dist_quintile) <span class="sc">%&gt;%</span></span>
-<span id="cb71-11"><a href="#cb71-11" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">pct =</span> <span class="fu">round</span>(n <span class="sc">/</span> <span class="fu">sum</span>(n) <span class="sc">*</span> <span class="dv">100</span>, <span class="dv">1</span>)) <span class="sc">%&gt;%</span></span>
-<span id="cb71-12"><a href="#cb71-12" tabindex="-1"></a>  <span class="fu">print</span>()</span></code></pre></div>
-<pre><code>## # A tibble: 5 × 3
-##   dist_quintile     n   pct
-##           &lt;int&gt; &lt;int&gt; &lt;dbl&gt;
-## 1             1   845  20.2
-## 2             2   838  20.1
-## 3             3   835  20  
-## 4             4   830  19.9
-## 5             5   827  19.8</code></pre>
-</div>
-<div id="player-archetype-quadrant-classification" class="section level2">
-<h2>4.5 Player archetype (quadrant classification)</h2>
-<p>Based on whether a player is above or below the season average in
-both distance and accuracy. Simple, interpretable, and robust to
-year-over-year changes in absolute values.</p>
-<div class="sourceCode" id="cb73"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb73-1"><a href="#cb73-1" tabindex="-1"></a>df_clean <span class="ot">&lt;-</span> df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb73-2"><a href="#cb73-2" tabindex="-1"></a>  <span class="fu">mutate</span>(</span>
-<span id="cb73-3"><a href="#cb73-3" tabindex="-1"></a>    <span class="at">archetype =</span> <span class="fu">case_when</span>(</span>
-<span id="cb73-4"><a href="#cb73-4" tabindex="-1"></a>      dist_vs_field <span class="sc">&gt;=</span> <span class="dv">0</span> <span class="sc">&amp;</span> acc_vs_field <span class="sc">&gt;=</span> <span class="dv">0</span> <span class="sc">~</span> <span class="st">&quot;Long / Accurate&quot;</span>,</span>
-<span id="cb73-5"><a href="#cb73-5" tabindex="-1"></a>      dist_vs_field <span class="sc">&gt;=</span> <span class="dv">0</span> <span class="sc">&amp;</span> acc_vs_field <span class="sc">&lt;</span>  <span class="dv">0</span> <span class="sc">~</span> <span class="st">&quot;Long / Inaccurate&quot;</span>,</span>
-<span id="cb73-6"><a href="#cb73-6" tabindex="-1"></a>      dist_vs_field <span class="sc">&lt;</span>  <span class="dv">0</span> <span class="sc">&amp;</span> acc_vs_field <span class="sc">&gt;=</span> <span class="dv">0</span> <span class="sc">~</span> <span class="st">&quot;Short / Accurate&quot;</span>,</span>
-<span id="cb73-7"><a href="#cb73-7" tabindex="-1"></a>      dist_vs_field <span class="sc">&lt;</span>  <span class="dv">0</span> <span class="sc">&amp;</span> acc_vs_field <span class="sc">&lt;</span>  <span class="dv">0</span> <span class="sc">~</span> <span class="st">&quot;Short / Inaccurate&quot;</span>,</span>
-<span id="cb73-8"><a href="#cb73-8" tabindex="-1"></a>      <span class="cn">TRUE</span> <span class="sc">~</span> <span class="cn">NA_character_</span></span>
-<span id="cb73-9"><a href="#cb73-9" tabindex="-1"></a>    ) <span class="sc">%&gt;%</span> <span class="fu">factor</span>(<span class="at">levels =</span> <span class="fu">c</span>(</span>
-<span id="cb73-10"><a href="#cb73-10" tabindex="-1"></a>      <span class="st">&quot;Long / Accurate&quot;</span>, <span class="st">&quot;Long / Inaccurate&quot;</span>,</span>
-<span id="cb73-11"><a href="#cb73-11" tabindex="-1"></a>      <span class="st">&quot;Short / Accurate&quot;</span>, <span class="st">&quot;Short / Inaccurate&quot;</span></span>
-<span id="cb73-12"><a href="#cb73-12" tabindex="-1"></a>    ))</span>
-<span id="cb73-13"><a href="#cb73-13" tabindex="-1"></a>  )</span>
-<span id="cb73-14"><a href="#cb73-14" tabindex="-1"></a></span>
-<span id="cb73-15"><a href="#cb73-15" tabindex="-1"></a>df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb73-16"><a href="#cb73-16" tabindex="-1"></a>  <span class="fu">count</span>(archetype) <span class="sc">%&gt;%</span></span>
-<span id="cb73-17"><a href="#cb73-17" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">pct =</span> <span class="fu">round</span>(n <span class="sc">/</span> <span class="fu">sum</span>(n) <span class="sc">*</span> <span class="dv">100</span>, <span class="dv">1</span>)) <span class="sc">%&gt;%</span></span>
-<span id="cb73-18"><a href="#cb73-18" tabindex="-1"></a>  <span class="fu">print</span>()</span></code></pre></div>
-<pre><code>## # A tibble: 4 × 3
-##   archetype              n   pct
-##   &lt;fct&gt;              &lt;int&gt; &lt;dbl&gt;
-## 1 Long / Accurate      576  13.8
-## 2 Long / Inaccurate   1464  35.1
-## 3 Short / Accurate    1509  36.1
-## 4 Short / Inaccurate   626  15</code></pre>
-</div>
-<div id="career-entry-distance-strokes-gained-era" class="section level2">
-<h2>4.6 Career entry distance (strokes-gained era)</h2>
-<p>Each player’s distance in their first <em>strokes-gained-era</em>
-observed season (<code>sg_entry_year</code>) — distinct from the
-cross-referenced <code>entry_year</code> in section 3.4, since ball
-speed/CHS only exist within <code>df_complete</code>’s 2004+ window.
-Used in survival analysis and rising floor analyses to ask “what did you
-arrive with, once we could measure speed?”</p>
-<div class="sourceCode" id="cb75"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb75-1"><a href="#cb75-1" tabindex="-1"></a>entry_stats <span class="ot">&lt;-</span> df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb75-2"><a href="#cb75-2" tabindex="-1"></a>  <span class="fu">group_by</span>(player_name) <span class="sc">%&gt;%</span></span>
-<span id="cb75-3"><a href="#cb75-3" tabindex="-1"></a>  <span class="fu">slice_min</span>(year, <span class="at">n =</span> <span class="dv">1</span>, <span class="at">with_ties =</span> <span class="cn">FALSE</span>) <span class="sc">%&gt;%</span></span>
-<span id="cb75-4"><a href="#cb75-4" tabindex="-1"></a>  <span class="fu">select</span>(player_name, <span class="at">dist_entry =</span> distance, <span class="at">speed_entry =</span> ball_speed,</span>
-<span id="cb75-5"><a href="#cb75-5" tabindex="-1"></a>         <span class="at">chs_entry =</span> chs, <span class="at">sg_entry_year =</span> year) <span class="sc">%&gt;%</span></span>
-<span id="cb75-6"><a href="#cb75-6" tabindex="-1"></a>  <span class="fu">ungroup</span>()</span>
-<span id="cb75-7"><a href="#cb75-7" tabindex="-1"></a></span>
-<span id="cb75-8"><a href="#cb75-8" tabindex="-1"></a>df_clean <span class="ot">&lt;-</span> df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb75-9"><a href="#cb75-9" tabindex="-1"></a>  <span class="fu">left_join</span>(entry_stats, <span class="at">by =</span> <span class="st">&quot;player_name&quot;</span>)</span>
-<span id="cb75-10"><a href="#cb75-10" tabindex="-1"></a></span>
-<span id="cb75-11"><a href="#cb75-11" tabindex="-1"></a><span class="co"># Quick check</span></span>
-<span id="cb75-12"><a href="#cb75-12" tabindex="-1"></a>df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb75-13"><a href="#cb75-13" tabindex="-1"></a>  <span class="fu">select</span>(player_name, year, distance, dist_entry, sg_entry_year) <span class="sc">%&gt;%</span></span>
-<span id="cb75-14"><a href="#cb75-14" tabindex="-1"></a>  <span class="fu">filter</span>(player_name <span class="sc">==</span> <span class="fu">first</span>(player_name)) <span class="sc">%&gt;%</span></span>
-<span id="cb75-15"><a href="#cb75-15" tabindex="-1"></a>  <span class="fu">print</span>()</span></code></pre></div>
-<pre><code>## # A tibble: 20 × 5
-##    player_name     year distance dist_entry sg_entry_year
-##    &lt;chr&gt;          &lt;int&gt;    &lt;dbl&gt;      &lt;dbl&gt;         &lt;int&gt;
-##  1 Aaron Baddeley  2004     288         288          2004
-##  2 Aaron Baddeley  2005     291.        288          2004
-##  3 Aaron Baddeley  2006     288.        288          2004
-##  4 Aaron Baddeley  2007     292.        288          2004
-##  5 Aaron Baddeley  2008     290.        288          2004
-##  6 Aaron Baddeley  2009     288.        288          2004
-##  7 Aaron Baddeley  2010     299.        288          2004
-##  8 Aaron Baddeley  2011     296.        288          2004
-##  9 Aaron Baddeley  2012     292         288          2004
-## 10 Aaron Baddeley  2013     288.        288          2004
-## 11 Aaron Baddeley  2014     294.        288          2004
-## 12 Aaron Baddeley  2015     294.        288          2004
-## 13 Aaron Baddeley  2016     292.        288          2004
-## 14 Aaron Baddeley  2017     293.        288          2004
-## 15 Aaron Baddeley  2018     295.        288          2004
-## 16 Aaron Baddeley  2019     286.        288          2004
-## 17 Aaron Baddeley  2020     285.        288          2004
-## 18 Aaron Baddeley  2021     289.        288          2004
-## 19 Aaron Baddeley  2023     284.        288          2004
-## 20 Aaron Baddeley  2024     283.        288          2004</code></pre>
-</div>
-<div id="distance-quartile-at-career-entry" class="section level2">
-<h2>4.7 Distance quartile at career entry</h2>
-<p>Used in survival analysis as a time-fixed predictor — what distance
-tier did a player arrive in (within the strokes-gained era)?</p>
-<div class="sourceCode" id="cb77"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb77-1"><a href="#cb77-1" tabindex="-1"></a><span class="co"># Quartile within entry year&#39;s field</span></span>
-<span id="cb77-2"><a href="#cb77-2" tabindex="-1"></a>entry_quartiles <span class="ot">&lt;-</span> df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb77-3"><a href="#cb77-3" tabindex="-1"></a>  <span class="fu">filter</span>(year <span class="sc">==</span> sg_entry_year) <span class="sc">%&gt;%</span></span>
-<span id="cb77-4"><a href="#cb77-4" tabindex="-1"></a>  <span class="fu">group_by</span>(year) <span class="sc">%&gt;%</span></span>
-<span id="cb77-5"><a href="#cb77-5" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">dist_entry_quartile =</span> <span class="fu">ntile</span>(distance, <span class="dv">4</span>)) <span class="sc">%&gt;%</span></span>
-<span id="cb77-6"><a href="#cb77-6" tabindex="-1"></a>  <span class="fu">ungroup</span>() <span class="sc">%&gt;%</span></span>
-<span id="cb77-7"><a href="#cb77-7" tabindex="-1"></a>  <span class="fu">select</span>(player_name, dist_entry_quartile)</span>
-<span id="cb77-8"><a href="#cb77-8" tabindex="-1"></a></span>
-<span id="cb77-9"><a href="#cb77-9" tabindex="-1"></a>df_clean <span class="ot">&lt;-</span> df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb77-10"><a href="#cb77-10" tabindex="-1"></a>  <span class="fu">left_join</span>(entry_quartiles, <span class="at">by =</span> <span class="st">&quot;player_name&quot;</span>)</span>
-<span id="cb77-11"><a href="#cb77-11" tabindex="-1"></a></span>
-<span id="cb77-12"><a href="#cb77-12" tabindex="-1"></a>df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb77-13"><a href="#cb77-13" tabindex="-1"></a>  <span class="fu">count</span>(dist_entry_quartile) <span class="sc">%&gt;%</span></span>
-<span id="cb77-14"><a href="#cb77-14" tabindex="-1"></a>  <span class="fu">print</span>()</span></code></pre></div>
-<pre><code>## # A tibble: 4 × 2
-##   dist_entry_quartile     n
-##                 &lt;int&gt; &lt;int&gt;
-## 1                   1   802
-## 2                   2   971
-## 3                   3  1136
-## 4                   4  1266</code></pre>
-<hr />
-</div>
-</div>
-<div id="clean-and-engineer-df_trends" class="section level1">
-<h1>5. Clean and Engineer df_trends</h1>
-<div id="standardise-column-names" class="section level2">
-<h2>5.1 Standardise column names</h2>
-<div class="sourceCode" id="cb79"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb79-1"><a href="#cb79-1" tabindex="-1"></a>df_trends <span class="ot">&lt;-</span> df_trends_raw <span class="sc">%&gt;%</span></span>
-<span id="cb79-2"><a href="#cb79-2" tabindex="-1"></a>  <span class="fu">rename</span>(<span class="at">player_name =</span> player) <span class="sc">%&gt;%</span></span>
-<span id="cb79-3"><a href="#cb79-3" tabindex="-1"></a>  <span class="fu">mutate</span>(</span>
-<span id="cb79-4"><a href="#cb79-4" tabindex="-1"></a>    <span class="at">player_name =</span> <span class="fu">as.character</span>(player_name),</span>
-<span id="cb79-5"><a href="#cb79-5" tabindex="-1"></a>    <span class="at">year        =</span> <span class="fu">as.integer</span>(year)</span>
-<span id="cb79-6"><a href="#cb79-6" tabindex="-1"></a>  )</span></code></pre></div>
-</div>
-<div id="minimum-seasons-filter-1" class="section level2">
-<h2>5.2 Minimum seasons filter</h2>
-<div class="sourceCode" id="cb80"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb80-1"><a href="#cb80-1" tabindex="-1"></a>seasons_trends <span class="ot">&lt;-</span> df_trends <span class="sc">%&gt;%</span></span>
-<span id="cb80-2"><a href="#cb80-2" tabindex="-1"></a>  <span class="fu">count</span>(player_name, <span class="at">name =</span> <span class="st">&quot;n_seasons&quot;</span>)</span>
-<span id="cb80-3"><a href="#cb80-3" tabindex="-1"></a></span>
-<span id="cb80-4"><a href="#cb80-4" tabindex="-1"></a>df_trends <span class="ot">&lt;-</span> df_trends <span class="sc">%&gt;%</span></span>
-<span id="cb80-5"><a href="#cb80-5" tabindex="-1"></a>  <span class="fu">left_join</span>(seasons_trends, <span class="at">by =</span> <span class="st">&quot;player_name&quot;</span>) <span class="sc">%&gt;%</span></span>
-<span id="cb80-6"><a href="#cb80-6" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">multi_season =</span> n_seasons <span class="sc">&gt;=</span> MIN_SEASONS)</span>
-<span id="cb80-7"><a href="#cb80-7" tabindex="-1"></a></span>
-<span id="cb80-8"><a href="#cb80-8" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Players with 1 season only: &quot;</span>,</span>
-<span id="cb80-9"><a href="#cb80-9" tabindex="-1"></a>    <span class="fu">sum</span>(seasons_trends<span class="sc">$</span>n_seasons <span class="sc">&lt;</span> MIN_SEASONS), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Players with 1 season only:  278</code></pre>
-<div class="sourceCode" id="cb82"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb82-1"><a href="#cb82-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Players with 2+ seasons:    &quot;</span>,</span>
-<span id="cb82-2"><a href="#cb82-2" tabindex="-1"></a>    <span class="fu">sum</span>(seasons_trends<span class="sc">$</span>n_seasons <span class="sc">&gt;=</span> MIN_SEASONS), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Players with 2+ seasons:     906</code></pre>
-</div>
-<div id="verify-and-standardise-field-relative-metrics" class="section level2">
-<h2>5.3 Verify and standardise field-relative metrics</h2>
-<p>The raw file already contains <code>relative_distance</code> and
-<code>relative_accuracy</code> (player value minus season mean). We
-verify these match our own calculation and rename to match the
-<code>df_main</code> convention.</p>
-<div class="sourceCode" id="cb84"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb84-1"><a href="#cb84-1" tabindex="-1"></a><span class="co"># Recalculate to verify</span></span>
-<span id="cb84-2"><a href="#cb84-2" tabindex="-1"></a>df_trends <span class="ot">&lt;-</span> df_trends <span class="sc">%&gt;%</span></span>
-<span id="cb84-3"><a href="#cb84-3" tabindex="-1"></a>  <span class="fu">group_by</span>(year) <span class="sc">%&gt;%</span></span>
-<span id="cb84-4"><a href="#cb84-4" tabindex="-1"></a>  <span class="fu">mutate</span>(</span>
-<span id="cb84-5"><a href="#cb84-5" tabindex="-1"></a>    <span class="at">dist_vs_field_check =</span> distance <span class="sc">-</span> <span class="fu">mean</span>(distance, <span class="at">na.rm =</span> <span class="cn">TRUE</span>),</span>
-<span id="cb84-6"><a href="#cb84-6" tabindex="-1"></a>    <span class="at">acc_vs_field_check  =</span> accuracy <span class="sc">-</span> <span class="fu">mean</span>(accuracy, <span class="at">na.rm =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb84-7"><a href="#cb84-7" tabindex="-1"></a>  ) <span class="sc">%&gt;%</span></span>
-<span id="cb84-8"><a href="#cb84-8" tabindex="-1"></a>  <span class="fu">ungroup</span>()</span>
-<span id="cb84-9"><a href="#cb84-9" tabindex="-1"></a></span>
-<span id="cb84-10"><a href="#cb84-10" tabindex="-1"></a><span class="co"># Compare to existing columns (should be near zero difference)</span></span>
-<span id="cb84-11"><a href="#cb84-11" tabindex="-1"></a>df_trends <span class="sc">%&gt;%</span></span>
-<span id="cb84-12"><a href="#cb84-12" tabindex="-1"></a>  <span class="fu">summarise</span>(</span>
-<span id="cb84-13"><a href="#cb84-13" tabindex="-1"></a>    <span class="at">dist_diff_max =</span> <span class="fu">max</span>(<span class="fu">abs</span>(relative_distance <span class="sc">-</span> dist_vs_field_check), <span class="at">na.rm =</span> <span class="cn">TRUE</span>),</span>
-<span id="cb84-14"><a href="#cb84-14" tabindex="-1"></a>    <span class="at">acc_diff_max  =</span> <span class="fu">max</span>(<span class="fu">abs</span>(relative_accuracy <span class="sc">-</span> acc_vs_field_check),  <span class="at">na.rm =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb84-15"><a href="#cb84-15" tabindex="-1"></a>  ) <span class="sc">%&gt;%</span></span>
-<span id="cb84-16"><a href="#cb84-16" tabindex="-1"></a>  <span class="fu">print</span>()</span></code></pre></div>
-<pre><code>## # A tibble: 1 × 2
-##   dist_diff_max acc_diff_max
-##           &lt;dbl&gt;        &lt;dbl&gt;
-## 1      4.97e-14     5.15e-14</code></pre>
-<div class="sourceCode" id="cb86"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb86-1"><a href="#cb86-1" tabindex="-1"></a><span class="co"># Rename to standard convention and drop check columns</span></span>
-<span id="cb86-2"><a href="#cb86-2" tabindex="-1"></a>df_trends <span class="ot">&lt;-</span> df_trends <span class="sc">%&gt;%</span></span>
-<span id="cb86-3"><a href="#cb86-3" tabindex="-1"></a>  <span class="fu">rename</span>(</span>
-<span id="cb86-4"><a href="#cb86-4" tabindex="-1"></a>    <span class="at">dist_vs_field =</span> relative_distance,</span>
-<span id="cb86-5"><a href="#cb86-5" tabindex="-1"></a>    <span class="at">acc_vs_field  =</span> relative_accuracy</span>
-<span id="cb86-6"><a href="#cb86-6" tabindex="-1"></a>  ) <span class="sc">%&gt;%</span></span>
-<span id="cb86-7"><a href="#cb86-7" tabindex="-1"></a>  <span class="fu">select</span>(<span class="sc">-</span>dist_vs_field_check, <span class="sc">-</span>acc_vs_field_check)</span></code></pre></div>
-</div>
-<div id="add-cohort-variables" class="section level2">
-<h2>5.4 Add cohort variables</h2>
-<div class="sourceCode" id="cb87"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb87-1"><a href="#cb87-1" tabindex="-1"></a><span class="co"># This file already goes back to 1987, so its own first-observed-year is</span></span>
-<span id="cb87-2"><a href="#cb87-2" tabindex="-1"></a><span class="co"># already a good entry-year estimate for players who don&#39;t reach df_complete</span></span>
-<span id="cb87-3"><a href="#cb87-3" tabindex="-1"></a><span class="co"># (no separate cross-referencing needed, unlike df_main&#39;s entry_cohort).</span></span>
-<span id="cb87-4"><a href="#cb87-4" tabindex="-1"></a>first_year_trends <span class="ot">&lt;-</span> df_trends <span class="sc">%&gt;%</span></span>
-<span id="cb87-5"><a href="#cb87-5" tabindex="-1"></a>  <span class="fu">group_by</span>(player_name) <span class="sc">%&gt;%</span></span>
-<span id="cb87-6"><a href="#cb87-6" tabindex="-1"></a>  <span class="fu">summarise</span>(<span class="at">first_year =</span> <span class="fu">min</span>(year)) <span class="sc">%&gt;%</span></span>
-<span id="cb87-7"><a href="#cb87-7" tabindex="-1"></a>  <span class="fu">ungroup</span>()</span>
-<span id="cb87-8"><a href="#cb87-8" tabindex="-1"></a></span>
-<span id="cb87-9"><a href="#cb87-9" tabindex="-1"></a>df_trends <span class="ot">&lt;-</span> df_trends <span class="sc">%&gt;%</span></span>
-<span id="cb87-10"><a href="#cb87-10" tabindex="-1"></a>  <span class="fu">left_join</span>(first_year_trends, <span class="at">by =</span> <span class="st">&quot;player_name&quot;</span>) <span class="sc">%&gt;%</span></span>
-<span id="cb87-11"><a href="#cb87-11" tabindex="-1"></a>  <span class="fu">mutate</span>(</span>
-<span id="cb87-12"><a href="#cb87-12" tabindex="-1"></a>    <span class="at">entry_cohort =</span> <span class="fu">case_when</span>(</span>
-<span id="cb87-13"><a href="#cb87-13" tabindex="-1"></a>      first_year <span class="sc">&lt;</span> <span class="dv">2000</span>              <span class="sc">~</span> <span class="st">&quot;pre-2000&quot;</span>,</span>
-<span id="cb87-14"><a href="#cb87-14" tabindex="-1"></a>      first_year <span class="sc">&gt;=</span> <span class="dv">2000</span> <span class="sc">&amp;</span> first_year <span class="sc">&lt;</span> <span class="dv">2010</span> <span class="sc">~</span> <span class="st">&quot;2000–2009&quot;</span>,</span>
-<span id="cb87-15"><a href="#cb87-15" tabindex="-1"></a>      first_year <span class="sc">&gt;=</span> <span class="dv">2010</span> <span class="sc">&amp;</span> first_year <span class="sc">&lt;</span> <span class="dv">2020</span> <span class="sc">~</span> <span class="st">&quot;2010–2019&quot;</span>,</span>
-<span id="cb87-16"><a href="#cb87-16" tabindex="-1"></a>      first_year <span class="sc">&gt;=</span> <span class="dv">2020</span>             <span class="sc">~</span> <span class="st">&quot;2020+&quot;</span>,</span>
-<span id="cb87-17"><a href="#cb87-17" tabindex="-1"></a>      <span class="cn">TRUE</span>                           <span class="sc">~</span> <span class="cn">NA_character_</span></span>
-<span id="cb87-18"><a href="#cb87-18" tabindex="-1"></a>    ) <span class="sc">%&gt;%</span> <span class="fu">factor</span>(<span class="at">levels =</span> <span class="fu">c</span>(<span class="st">&quot;pre-2000&quot;</span>, <span class="st">&quot;2000–2009&quot;</span>, <span class="st">&quot;2010–2019&quot;</span>, <span class="st">&quot;2020+&quot;</span>))</span>
-<span id="cb87-19"><a href="#cb87-19" tabindex="-1"></a>  )</span>
-<span id="cb87-20"><a href="#cb87-20" tabindex="-1"></a></span>
-<span id="cb87-21"><a href="#cb87-21" tabindex="-1"></a><span class="co"># Enrich with birth_cohort where the player also appears in df_complete.</span></span>
-<span id="cb87-22"><a href="#cb87-22" tabindex="-1"></a><span class="co"># Coverage is partial: df_complete only covers 793 of df_trends&#39;s 1184 players.</span></span>
-<span id="cb87-23"><a href="#cb87-23" tabindex="-1"></a>birth_lookup <span class="ot">&lt;-</span> df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb87-24"><a href="#cb87-24" tabindex="-1"></a>  <span class="fu">distinct</span>(player_name, birth_cohort)</span>
-<span id="cb87-25"><a href="#cb87-25" tabindex="-1"></a></span>
-<span id="cb87-26"><a href="#cb87-26" tabindex="-1"></a>df_trends <span class="ot">&lt;-</span> df_trends <span class="sc">%&gt;%</span></span>
-<span id="cb87-27"><a href="#cb87-27" tabindex="-1"></a>  <span class="fu">left_join</span>(birth_lookup, <span class="at">by =</span> <span class="st">&quot;player_name&quot;</span>)</span>
-<span id="cb87-28"><a href="#cb87-28" tabindex="-1"></a></span>
-<span id="cb87-29"><a href="#cb87-29" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Players with birth_cohort available (matched to df_complete):&quot;</span>,</span>
-<span id="cb87-30"><a href="#cb87-30" tabindex="-1"></a>    <span class="fu">n_distinct</span>(df_trends<span class="sc">$</span>player_name[<span class="sc">!</span><span class="fu">is.na</span>(df_trends<span class="sc">$</span>birth_cohort)]), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Players with birth_cohort available (matched to df_complete): 793</code></pre>
-<div class="sourceCode" id="cb89"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb89-1"><a href="#cb89-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Total players in df_trends:                                 &quot;</span>,</span>
-<span id="cb89-2"><a href="#cb89-2" tabindex="-1"></a>    <span class="fu">n_distinct</span>(df_trends<span class="sc">$</span>player_name), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Total players in df_trends:                                  1184</code></pre>
-<hr />
-</div>
 </div>
 <div id="final-checks" class="section level1">
-<h1>6. Final Checks</h1>
-<div id="df_main-summary" class="section level2">
-<h2>6.1 df_main summary</h2>
-<div class="sourceCode" id="cb91"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb91-1"><a href="#cb91-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;=== df_main ===</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## === df_main ===</code></pre>
-<div class="sourceCode" id="cb93"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb93-1"><a href="#cb93-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Rows:              &quot;</span>, <span class="fu">nrow</span>(df_clean), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
+<h1>5. Final Checks</h1>
+<div class="sourceCode" id="cb24"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb24-1"><a href="#cb24-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;=== df_survival ===</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
+<pre><code>## === df_survival ===</code></pre>
+<div class="sourceCode" id="cb26"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb26-1"><a href="#cb26-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Rows:              &quot;</span>, <span class="fu">nrow</span>(df_survival), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
 <pre><code>## Rows:               4175</code></pre>
-<div class="sourceCode" id="cb95"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb95-1"><a href="#cb95-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Unique players:    &quot;</span>, <span class="fu">n_distinct</span>(df_clean<span class="sc">$</span>player_name), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
+<div class="sourceCode" id="cb28"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb28-1"><a href="#cb28-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Unique players:    &quot;</span>, <span class="fu">n_distinct</span>(df_survival<span class="sc">$</span>player_name), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
 <pre><code>## Unique players:     793</code></pre>
-<div class="sourceCode" id="cb97"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb97-1"><a href="#cb97-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Year range:        &quot;</span>, <span class="fu">min</span>(df_clean<span class="sc">$</span>year), <span class="st">&quot;–&quot;</span>, <span class="fu">max</span>(df_clean<span class="sc">$</span>year), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
+<div class="sourceCode" id="cb30"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb30-1"><a href="#cb30-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Year range:        &quot;</span>, <span class="fu">min</span>(df_survival<span class="sc">$</span>year), <span class="st">&quot;–&quot;</span>, <span class="fu">max</span>(df_survival<span class="sc">$</span>year), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
 <pre><code>## Year range:         2004 – 2025</code></pre>
-<div class="sourceCode" id="cb99"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb99-1"><a href="#cb99-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Engineered columns:</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Engineered columns:</code></pre>
-<div class="sourceCode" id="cb101"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb101-1"><a href="#cb101-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot; &quot;</span>, <span class="fu">paste</span>(<span class="fu">c</span>(<span class="st">&quot;entry_year&quot;</span>, <span class="st">&quot;left_truncated&quot;</span>, <span class="st">&quot;years_on_tour&quot;</span>,</span>
-<span id="cb101-2"><a href="#cb101-2" tabindex="-1"></a>                 <span class="st">&quot;entry_cohort&quot;</span>, <span class="st">&quot;birth_cohort&quot;</span>, <span class="st">&quot;dist_vs_field&quot;</span>, <span class="st">&quot;acc_vs_field&quot;</span>,</span>
-<span id="cb101-3"><a href="#cb101-3" tabindex="-1"></a>                 <span class="st">&quot;speed_vs_field&quot;</span>, <span class="st">&quot;chs_vs_field&quot;</span>, <span class="st">&quot;dist_player_mean&quot;</span>,</span>
-<span id="cb101-4"><a href="#cb101-4" tabindex="-1"></a>                 <span class="st">&quot;dist_within&quot;</span>, <span class="st">&quot;dist_quintile&quot;</span>, <span class="st">&quot;archetype&quot;</span>,</span>
-<span id="cb101-5"><a href="#cb101-5" tabindex="-1"></a>                 <span class="st">&quot;dist_entry&quot;</span>, <span class="st">&quot;sg_entry_year&quot;</span>, <span class="st">&quot;dist_entry_quartile&quot;</span>), <span class="at">collapse =</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">  &quot;</span>), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>##   entry_year
-##   left_truncated
-##   years_on_tour
-##   entry_cohort
-##   birth_cohort
-##   dist_vs_field
-##   acc_vs_field
-##   speed_vs_field
-##   chs_vs_field
-##   dist_player_mean
-##   dist_within
-##   dist_quintile
-##   archetype
-##   dist_entry
-##   sg_entry_year
-##   dist_entry_quartile</code></pre>
-<div class="sourceCode" id="cb103"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb103-1"><a href="#cb103-1" tabindex="-1"></a><span class="co"># Spot check a well-known player if present</span></span>
-<span id="cb103-2"><a href="#cb103-2" tabindex="-1"></a><span class="cf">if</span> (<span class="st">&quot;Tiger Woods&quot;</span> <span class="sc">%in%</span> df_clean<span class="sc">$</span>player_name) {</span>
-<span id="cb103-3"><a href="#cb103-3" tabindex="-1"></a>  df_clean <span class="sc">%&gt;%</span></span>
-<span id="cb103-4"><a href="#cb103-4" tabindex="-1"></a>    <span class="fu">filter</span>(player_name <span class="sc">==</span> <span class="st">&quot;Tiger Woods&quot;</span>) <span class="sc">%&gt;%</span></span>
-<span id="cb103-5"><a href="#cb103-5" tabindex="-1"></a>    <span class="fu">select</span>(year, distance, dist_vs_field, dist_quintile, archetype,</span>
-<span id="cb103-6"><a href="#cb103-6" tabindex="-1"></a>           entry_year, entry_cohort, birth_cohort, left_truncated) <span class="sc">%&gt;%</span></span>
-<span id="cb103-7"><a href="#cb103-7" tabindex="-1"></a>    <span class="fu">print</span>()</span>
-<span id="cb103-8"><a href="#cb103-8" tabindex="-1"></a>}</span></code></pre></div>
-<pre><code>## # A tibble: 8 × 9
-##    year distance dist_vs_field dist_quintile archetype   entry_year entry_cohort
-##   &lt;int&gt;    &lt;dbl&gt;         &lt;dbl&gt;         &lt;int&gt; &lt;fct&gt;            &lt;dbl&gt; &lt;fct&gt;       
-## 1  2004     302.         14.7              5 Long / Ina…       1997 pre-2000    
-## 2  2005     316.         27.5              5 Long / Ina…       1997 pre-2000    
-## 3  2006     306.         16.9              5 Long / Ina…       1997 pre-2000    
-## 4  2007     302.         13.3              5 Long / Ina…       1997 pre-2000    
-## 5  2009     298.         10.4              5 Long / Acc…       1997 pre-2000    
-## 6  2012     297.          7.35             5 Long / Acc…       1997 pre-2000    
-## 7  2013     293.          5.28             4 Long / Acc…       1997 pre-2000    
-## 8  2018     304.          6.96             5 Long / Ina…       1997 pre-2000    
-## # ℹ 2 more variables: birth_cohort &lt;fct&gt;, left_truncated &lt;lgl&gt;</code></pre>
-</div>
-<div id="df_trends-summary" class="section level2">
-<h2>6.2 df_trends summary</h2>
-<div class="sourceCode" id="cb105"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb105-1"><a href="#cb105-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;=== df_trends ===</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## === df_trends ===</code></pre>
-<div class="sourceCode" id="cb107"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb107-1"><a href="#cb107-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Rows:              &quot;</span>, <span class="fu">nrow</span>(df_trends), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Rows:               7400</code></pre>
-<div class="sourceCode" id="cb109"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb109-1"><a href="#cb109-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Unique players:    &quot;</span>, <span class="fu">n_distinct</span>(df_trends<span class="sc">$</span>player_name), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Unique players:     1184</code></pre>
-<div class="sourceCode" id="cb111"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb111-1"><a href="#cb111-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Year range:        &quot;</span>, <span class="fu">min</span>(df_trends<span class="sc">$</span>year), <span class="st">&quot;–&quot;</span>, <span class="fu">max</span>(df_trends<span class="sc">$</span>year), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Year range:         1987 – 2025</code></pre>
+<div class="sourceCode" id="cb32"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb32-1"><a href="#cb32-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;</span><span class="sc">\n</span><span class="st">left_truncated players:&quot;</span>, <span class="fu">n_distinct</span>(df_survival<span class="sc">$</span>player_name[df_survival<span class="sc">$</span>left_truncated]), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
+<pre><code>## 
+## left_truncated players: 38</code></pre>
+<div class="sourceCode" id="cb34"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb34-1"><a href="#cb34-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;</span><span class="sc">\n</span><span class="st">final_gap_length distribution (final-spell rows only):</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
+<pre><code>## 
+## final_gap_length distribution (final-spell rows only):</code></pre>
+<div class="sourceCode" id="cb36"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb36-1"><a href="#cb36-1" tabindex="-1"></a>df_survival <span class="sc">%&gt;%</span></span>
+<span id="cb36-2"><a href="#cb36-2" tabindex="-1"></a>  <span class="fu">filter</span>(is_final_spell) <span class="sc">%&gt;%</span></span>
+<span id="cb36-3"><a href="#cb36-3" tabindex="-1"></a>  <span class="fu">count</span>(final_gap_length) <span class="sc">%&gt;%</span></span>
+<span id="cb36-4"><a href="#cb36-4" tabindex="-1"></a>  <span class="fu">arrange</span>(final_gap_length) <span class="sc">%&gt;%</span></span>
+<span id="cb36-5"><a href="#cb36-5" tabindex="-1"></a>  <span class="fu">print</span>()</span></code></pre></div>
+<pre><code>## # A tibble: 22 × 2
+##    final_gap_length     n
+##               &lt;int&gt; &lt;int&gt;
+##  1                0   873
+##  2                1   220
+##  3                2   198
+##  4                3   268
+##  5                4   162
+##  6                5    34
+##  7                6    82
+##  8                7   116
+##  9                8    92
+## 10                9   153
+## # ℹ 12 more rows</code></pre>
+<div class="sourceCode" id="cb38"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb38-1"><a href="#cb38-1" tabindex="-1"></a><span class="co"># Spot check a well-known player if present</span></span>
+<span id="cb38-2"><a href="#cb38-2" tabindex="-1"></a><span class="cf">if</span> (<span class="st">&quot;Tiger Woods&quot;</span> <span class="sc">%in%</span> df_survival<span class="sc">$</span>player_name) {</span>
+<span id="cb38-3"><a href="#cb38-3" tabindex="-1"></a>  df_survival <span class="sc">%&gt;%</span></span>
+<span id="cb38-4"><a href="#cb38-4" tabindex="-1"></a>    <span class="fu">filter</span>(player_name <span class="sc">==</span> <span class="st">&quot;Tiger Woods&quot;</span>) <span class="sc">%&gt;%</span></span>
+<span id="cb38-5"><a href="#cb38-5" tabindex="-1"></a>    <span class="fu">select</span>(year, entry_year, spell_id, gap_before, gap_after, time_start, time_stop) <span class="sc">%&gt;%</span></span>
+<span id="cb38-6"><a href="#cb38-6" tabindex="-1"></a>    <span class="fu">print</span>()</span>
+<span id="cb38-7"><a href="#cb38-7" tabindex="-1"></a>}</span></code></pre></div>
+<pre><code>## # A tibble: 8 × 7
+##    year entry_year spell_id gap_before gap_after time_start time_stop
+##   &lt;int&gt;      &lt;dbl&gt;    &lt;dbl&gt;      &lt;dbl&gt;     &lt;dbl&gt;      &lt;dbl&gt;     &lt;dbl&gt;
+## 1  2004       1997        1         NA         1          7         8
+## 2  2005       1997        1         NA         1          8         9
+## 3  2006       1997        1         NA         1          9        10
+## 4  2007       1997        1         NA         1         10        11
+## 5  2009       1997        2          1         2         12        13
+## 6  2012       1997        3          2         4         15        16
+## 7  2013       1997        3          2         4         16        17
+## 8  2018       1997        4          4        NA         21        22</code></pre>
 <hr />
 </div>
-</div>
-<div id="write-outputs" class="section level1">
-<h1>7. Write Outputs</h1>
-<div class="sourceCode" id="cb113"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb113-1"><a href="#cb113-1" tabindex="-1"></a><span class="fu">saveRDS</span>(df_clean,  <span class="fu">here</span>(PATH_PROCESSED, <span class="st">&quot;df_main.rds&quot;</span>))</span>
-<span id="cb113-2"><a href="#cb113-2" tabindex="-1"></a><span class="fu">saveRDS</span>(df_trends, <span class="fu">here</span>(PATH_PROCESSED, <span class="st">&quot;df_trends.rds&quot;</span>))</span>
-<span id="cb113-3"><a href="#cb113-3" tabindex="-1"></a></span>
-<span id="cb113-4"><a href="#cb113-4" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Outputs written to data/processed/:</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>## Outputs written to data/processed/:</code></pre>
-<div class="sourceCode" id="cb115"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb115-1"><a href="#cb115-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;  df_main.rds  — &quot;</span>, <span class="fu">nrow</span>(df_clean),  <span class="st">&quot;rows,&quot;</span>,</span>
-<span id="cb115-2"><a href="#cb115-2" tabindex="-1"></a>    <span class="fu">n_distinct</span>(df_clean<span class="sc">$</span>player_name),  <span class="st">&quot;players</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>##   df_main.rds  —  4175 rows, 793 players</code></pre>
-<div class="sourceCode" id="cb117"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb117-1"><a href="#cb117-1" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;  df_trends.rds —&quot;</span>, <span class="fu">nrow</span>(df_trends), <span class="st">&quot;rows,&quot;</span>,</span>
-<span id="cb117-2"><a href="#cb117-2" tabindex="-1"></a>    <span class="fu">n_distinct</span>(df_trends<span class="sc">$</span>player_name), <span class="st">&quot;players</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
-<pre><code>##   df_trends.rds — 7400 rows, 1184 players</code></pre>
+<div id="write-output" class="section level1">
+<h1>6. Write Output</h1>
+<div class="sourceCode" id="cb40"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb40-1"><a href="#cb40-1" tabindex="-1"></a><span class="fu">saveRDS</span>(df_survival, <span class="fu">here</span>(PATH_PROCESSED, <span class="st">&quot;df_survival.rds&quot;</span>))</span>
+<span id="cb40-2"><a href="#cb40-2" tabindex="-1"></a></span>
+<span id="cb40-3"><a href="#cb40-3" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Output written to data/processed/df_survival.rds —&quot;</span>,</span>
+<span id="cb40-4"><a href="#cb40-4" tabindex="-1"></a>    <span class="fu">nrow</span>(df_survival), <span class="st">&quot;rows,&quot;</span>, <span class="fu">n_distinct</span>(df_survival<span class="sc">$</span>player_name), <span class="st">&quot;players</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
+<pre><code>## Output written to data/processed/df_survival.rds — 4175 rows, 793 players</code></pre>
 <hr />
 </div>
 <div id="session-info" class="section level1">
-<h1>8. Session Info</h1>
-<div class="sourceCode" id="cb119"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb119-1"><a href="#cb119-1" tabindex="-1"></a><span class="fu">sessionInfo</span>()</span></code></pre></div>
+<h1>7. Session Info</h1>
+<div class="sourceCode" id="cb42"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb42-1"><a href="#cb42-1" tabindex="-1"></a><span class="fu">sessionInfo</span>()</span></code></pre></div>
 <pre><code>## R version 4.4.1 (2024-06-14)
 ## Platform: aarch64-apple-darwin20
 ## Running under: macOS Sonoma 14.5
@@ -3616,22 +3096,21 @@ verify these match our own calculation and rename to match the
 ## [1] stats     graphics  grDevices utils     datasets  methods   base     
 ## 
 ## other attached packages:
-##  [1] broom_1.0.12    here_1.0.2      lubridate_1.9.5 forcats_1.0.0  
-##  [5] stringr_1.6.0   dplyr_1.2.0     purrr_1.2.1     readr_2.2.0    
-##  [9] tidyr_1.3.2     tibble_3.3.1    ggplot2_3.5.2   tidyverse_2.0.0
+##  [1] here_1.0.2      lubridate_1.9.5 forcats_1.0.0   stringr_1.6.0  
+##  [5] dplyr_1.2.0     purrr_1.2.1     readr_2.2.0     tidyr_1.3.2    
+##  [9] tibble_3.3.1    ggplot2_3.5.2   tidyverse_2.0.0
 ## 
 ## loaded via a namespace (and not attached):
-##  [1] bit_4.0.5         gtable_0.3.5      jsonlite_2.0.0    crayon_1.5.3     
-##  [5] compiler_4.4.1    tidyselect_1.2.1  parallel_4.4.1    jquerylib_0.1.4  
-##  [9] scales_1.3.0      yaml_2.3.10       fastmap_1.2.0     R6_2.6.1         
-## [13] generics_0.1.4    knitr_1.48        backports_1.5.0   rprojroot_2.1.1  
-## [17] munsell_0.5.1     bslib_0.8.0       pillar_1.11.1     tzdb_0.5.0       
-## [21] rlang_1.1.7       utf8_1.2.6        cachem_1.1.0      stringi_1.8.7    
-## [25] xfun_0.52         sass_0.4.9        bit64_4.0.5       timechange_0.4.0 
-## [29] cli_3.6.5         withr_3.0.2       magrittr_2.0.4    digest_0.6.37    
-## [33] grid_4.4.1        vroom_1.7.0       hms_1.1.4         lifecycle_1.0.5  
-## [37] vctrs_0.7.2       evaluate_0.24.0   glue_1.8.0        colorspace_2.1-1 
-## [41] rmarkdown_2.30    tools_4.4.1       pkgconfig_2.0.3   htmltools_0.5.8.1</code></pre>
+##  [1] gtable_0.3.5      jsonlite_2.0.0    compiler_4.4.1    tidyselect_1.2.1 
+##  [5] jquerylib_0.1.4   scales_1.3.0      yaml_2.3.10       fastmap_1.2.0    
+##  [9] R6_2.6.1          generics_0.1.4    knitr_1.48        rprojroot_2.1.1  
+## [13] munsell_0.5.1     bslib_0.8.0       pillar_1.11.1     tzdb_0.5.0       
+## [17] rlang_1.1.7       utf8_1.2.6        cachem_1.1.0      stringi_1.8.7    
+## [21] xfun_0.52         sass_0.4.9        timechange_0.4.0  cli_3.6.5        
+## [25] withr_3.0.2       magrittr_2.0.4    digest_0.6.37     grid_4.4.1       
+## [29] hms_1.1.4         lifecycle_1.0.5   vctrs_0.7.2       evaluate_0.24.0  
+## [33] glue_1.8.0        colorspace_2.1-1  rmarkdown_2.30    tools_4.4.1      
+## [37] pkgconfig_2.0.3   htmltools_0.5.8.1</code></pre>
 </div>
 
 

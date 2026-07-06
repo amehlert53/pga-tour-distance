@@ -29,6 +29,9 @@ Claude Code for any task in this repository.
 ## Datasets
 
 ### df_complete.csv (`data/raw/`)
+The strokes-gained-era dataset: richer per-season stats (speed, strokes
+gained), but only available from 2004 onward. A player's first row here is
+**not** necessarily their true PGA Tour debut — see `entry_year` below.
 - **Coverage:** 2004–2025, PGA Tour season-level player records
 - **Unit:** One row per player-season
 - **Key columns:**
@@ -46,6 +49,11 @@ Claude Code for any task in this repository.
   - `sg_total` — strokes gained: total
 
 ### trends_acc_dist_1987_to_2025.csv (`data/raw/`)
+The long-history dataset: only distance/accuracy (no speed or strokes
+gained), but goes back to 1987. Used in `00_data_engineering.Rmd` to
+cross-reference `df_complete`'s players and recover a true tour-entry year
+for the ~25% of players whose first `df_complete` row is 2004 but who were
+actually already active beforehand.
 - **Coverage:** 1987–2025, PGA Tour season-level player records
 - **Unit:** One row per player-season
 - **Key columns:**
@@ -61,18 +69,31 @@ All outputs written to `data/processed/`.
 
 | Variable | Description |
 |---|---|
-| `years_on_tour` | `year - rookie_year` |
-| `cohort` | Decade turned pro: pre-2000, 2000–2009, 2010–2019, 2020+ |
+| `entry_year` | True tour-entry year — `min(year)` across `df_complete` **and** the trends file, by player name |
+| `left_truncated` | `TRUE` if `entry_year` equals the trends file's own start (1987) — true entry may predate the data window |
+| `years_on_tour` | `year - entry_year` |
+| `entry_cohort` | Decade of `entry_year`: pre-2000, 2000–2009, 2010–2019, 2020+. Career-stage lens — use for tenure/survival questions |
+| `birth_cohort` | Decade of `birth_year`: Pre-1970, 1970s, 1980s, 1990s, 2000s+. Generational lens — use for "did the player population change" questions |
 | `dist_vs_field` | `distance - mean(distance)` within each year |
 | `speed_vs_field` | `ball_speed - mean(ball_speed)` within each year |
 | `chs_vs_field` | `chs - mean(chs)` within each year |
 | `dist_player_mean` | Career-average distance for each player (Mundlak between-effect) |
 | `dist_within` | `distance - dist_player_mean` (Mundlak within-effect) |
-| `last_year` | Last year a player appears in the dataset |
-| `career_ended` | 1 if `last_year` ≤ 2024, 0 if still active (censored) |
-| `dist_entry` | Distance in player's first observed season |
+| `sg_entry_year` | First strokes-gained-era observed season (first row in `df_complete`) — distinct from `entry_year`, only used to pull `dist_entry`/`speed_entry`/`chs_entry` since those stats don't exist before 2004 |
+| `dist_entry` | Distance in player's first strokes-gained-era season (`sg_entry_year`) |
+| `dist_entry_quartile` | Distance quartile within `sg_entry_year`'s field |
 | `dist_quintile` | Distance quintile within each year (1=shortest, 5=longest) |
 | `archetype` | Quadrant: Long/Accurate, Long/Inaccurate, Short/Accurate, Short/Inaccurate |
+
+`rookie_year`/`turned_pro` are kept as raw columns but are **not** the basis
+for any engineered variable above — `turned_pro` has a median 7-year (62%
+>5-year) gap to actual PGA Tour entry, and `rookie_year` is NA for 79
+rows/28 players. See `00_data_engineering.Rmd` section 3.2b/3.4 for the
+full reasoning.
+
+`00b_survival_prep.Rmd` engineers a further set of spell/gap variables
+(`spell_id`, `gap_before`, `gap_after`, `is_final_spell`,
+`final_gap_length`) — see Project 7 below.
 
 ---
 
@@ -172,7 +193,7 @@ in distance and accuracy trends?
 **Key visuals:**
 - Extended Image 3 (3 panels: distance, ball speed, CHS)
 - Competitive threshold curves
-- Time-to-obsolescence violin by cohort
+- Time-to-obsolescence violin by `entry_cohort` (career-stage lens, not birth_cohort)
 
 ---
 
@@ -202,15 +223,23 @@ speed? Is the age of peak distance changing?
 
 **Data:** `df_complete` (2004–2025); minimum 3 seasons required.
 
+**Note on cohort choice:** this project's questions are about generational
+change (did golfers who grew up with different equipment/training enter
+differently), which `birth_cohort` isolates — `entry_cohort` would mix a
+22-year-old rookie with a late-blooming 35-year-old debut in the same
+bucket. Use `birth_cohort` for the analyses below unless a specific question
+is actually about career stage.
+
 **Key analyses:**
 - Age-distance polynomial curve: `distance ~ age + age² + (1 + age | player)` via lme4
-- Cohort trajectory: entry-year-aligned distance by cohort decade
-- Rookie entry speed over time: first-season distance/speed by rookie year
+- Cohort trajectory: entry-year-aligned distance by `birth_cohort`
+- Rookie entry speed over time: first-season distance/speed by `entry_year`
+  (already available as `dist_entry`/`speed_entry`/`entry_year`, no rebuild needed)
 - Mundlak decomposition: `distance ~ year + dist_player_mean + dist_within + age + age²`
-- Peak age estimation by cohort: `-β_age / (2 × β_age²)`
+- Peak age estimation by `birth_cohort`: `-β_age / (2 × β_age²)`
 
 **Key visuals:**
-- Age-distance curve with CI ribbon, faceted by cohort
+- Age-distance curve with CI ribbon, faceted by `birth_cohort`
 - Cohort trajectory overlaid lines
 - Rookie entry speed scatter with trend
 - Mundlak decomposition bar chart
@@ -225,18 +254,33 @@ Has being short off the tee become a stronger predictor of career exit?
 
 **Survival dataset structure:**
 - One row per player-year (start-stop format for time-varying Cox)
-- `time_start`, `time_stop`: career years (from rookie year)
-- `event`: 1 = career ended, 0 = censored
-- `dist_entry_quartile`: distance quartile at career entry
+- `time_start`, `time_stop`: calendar tenure, `year - entry_year`
+- `spell_id`, `spell_start_year`, `spell_end_year`: a player's distinct runs
+  of consecutive observed seasons (players frequently have gap seasons —
+  35% of players miss at least one season, and in 165 cases a player missed
+  2+ *consecutive* seasons and later returned)
+- `gap_before`, `gap_after`: seasons missed before/after a given spell
+- `is_final_spell`, `final_gap_length`: flags a player's last observed spell
+  and how many years since it ended (as of 2025)
+- `left_truncated`: carried from `df_main` — `entry_year` may understate
+  true tenure for this subgroup
+- `dist_entry_quartile`: distance quartile at strokes-gained-era entry
 - Time-varying: `dist_vs_field`, `sg_total`, `age` — updated each year
 
-**Censoring rule:** A player is considered to have experienced the event (career end)
-if absent from the dataset for 2+ consecutive seasons before 2024. Players last seen in
-2024 or 2025 are right-censored.
+**Censoring rule:** deliberately **not** fixed upstream. `00b_survival_prep.Rmd`
+computes the spell/gap primitives above but does not hard-code a single
+`event`/"career ended" rule — an earlier fixed rule ("absent 2+ consecutive
+seasons = career end") was checked against the data and found to
+misclassify 165+ still-active careers, since gap-then-return is common
+(conditional status, injury, etc.). Build `event` from `final_gap_length` in
+**this** notebook instead, under a couple of candidate thresholds (e.g. ≥2,
+≥3, ≥4 years) as an explicit, named sensitivity check — don't silently pick
+one. Also compare full-sample vs. `left_truncated`-excluded results as a
+secondary robustness check.
 
 **Key analyses:**
 - Kaplan-Meier curves stratified by distance quartile at entry; log-rank test
-- Cox PH (time-fixed): `Surv(time, event) ~ dist_entry_quartile + cohort + sg_ott_avg + sg_putt_avg`
+- Cox PH (time-fixed): `Surv(time, event) ~ dist_entry_quartile + entry_cohort + sg_ott_avg + sg_putt_avg`
 - Cox PH (time-varying): start-stop format; `dist_vs_field` and `sg_total` as annual predictors
 - Era-stratified Cox: 2004–2012 vs. 2013–2025; compare distance HR across eras
 - Late-career survivor profile: 38+ vs. earlier-exit comparison
