@@ -1,0 +1,554 @@
+---
+title: "00 — Data Engineering"
+subtitle: "PGA Tour Distance & Speed Analytics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+# Overview
+
+This notebook is the single source of truth for all data cleaning and variable
+engineering in this project. It reads the two raw datasets, applies cleaning
+decisions, engineers all derived variables, and writes processed outputs to
+`data/processed/`. Every subsequent analysis notebook loads from those outputs
+rather than re-processing the raw data.
+
+**Inputs:**
+- `data/raw/df_complete.csv` — Player-season records, 2004–2025
+- `data/raw/trends_acc_dist_1987_to_2025.csv` — Distance and accuracy, 1987–2025
+
+**Outputs:**
+- `data/processed/df_main.rds` — Cleaned and engineered df_complete
+- `data/processed/df_trends.rds` — Cleaned df_trends
+
+**Note on survival data:** The survival analysis dataset (`df_survival.rds`) is
+constructed separately in `00b_survival_prep.Rmd` once we have sufficient
+familiarity with career gap patterns in the data to make defensible censoring
+decisions.
+
+---
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+# Core
+library(tidyverse)
+library(here)
+
+# Utilities
+library(broom)
+
+# Source shared config (paths, constants, regulatory events, plot theme)
+source(here::here("config.R"))
+
+# Reproducibility
+set.seed(2025)
+
+# Global knitr options
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+---
+
+# 2. Load Raw Data
+
+```{r load-data}
+df_raw <- read_csv(
+  here(PATH_RAW, "df_complete.csv"),
+  show_col_types = FALSE
+)
+
+df_trends_raw <- read_csv(
+  here(PATH_RAW, "trends_acc_dist_1987_to_2025.csv"),
+  show_col_types = FALSE
+)
+```
+
+## 2.1 Initial inspection — df_complete
+
+We rely on `player_name` + `year` as the unique key for this dataset in every
+downstream `left_join`. Confirm that holds before trusting any join result.
+
+```{r key-check-complete}
+n_dupes_complete <- df_raw %>%
+  count(player_name, year) %>%
+  filter(n > 1) %>%
+  nrow()
+
+cat("Rows:                    ", nrow(df_raw), "\n")
+cat("Distinct player+year keys:", n_distinct(df_raw$player_name, df_raw$year), "\n")
+cat("Duplicate player+year keys:", n_dupes_complete, "\n")
+
+stopifnot(n_dupes_complete == 0)
+```
+
+```{r inspect-complete}
+glimpse(df_raw)
+```
+
+```{r inspect-complete-summary}
+cat("Rows:           ", nrow(df_raw), "\n")
+cat("Unique players: ", n_distinct(df_raw$player_name), "\n")
+cat("Year range:     ", min(df_raw$year), "–", max(df_raw$year), "\n")
+cat("\nNA counts:\n")
+df_raw %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "n_missing") %>%
+  filter(n_missing > 0) %>%
+  print()
+```
+
+Sanity-check that key measures fall within plausible bounds for PGA Tour
+play. This is a coarse guard against data-entry errors, not a claim about
+true physical limits — values outside these ranges are reported, not
+dropped.
+
+```{r range-check-complete}
+df_raw %>%
+  summarise(
+    accuracy_out_of_range = sum(accuracy < 0 | accuracy > 100, na.rm = TRUE),
+    distance_out_of_range = sum(distance < 200 | distance > 350, na.rm = TRUE),
+    ball_speed_out_of_range = sum(ball_speed < 140 | ball_speed > 200, na.rm = TRUE),
+    chs_out_of_range = sum(chs < 90 | chs > 140, na.rm = TRUE),
+    carry_out_of_range = sum(carry_distance < 200 | carry_distance > 320, na.rm = TRUE)
+  ) %>%
+  print()
+```
+
+## 2.2 Initial inspection — df_trends
+
+```{r key-check-trends}
+n_dupes_trends <- df_trends_raw %>%
+  count(player, year) %>%
+  filter(n > 1) %>%
+  nrow()
+
+cat("Rows:                    ", nrow(df_trends_raw), "\n")
+cat("Distinct player+year keys:", n_distinct(df_trends_raw$player, df_trends_raw$year), "\n")
+cat("Duplicate player+year keys:", n_dupes_trends, "\n")
+
+stopifnot(n_dupes_trends == 0)
+```
+
+```{r inspect-trends}
+glimpse(df_trends_raw)
+```
+
+```{r inspect-trends-summary}
+cat("Rows:           ", nrow(df_trends_raw), "\n")
+cat("Unique players: ", n_distinct(df_trends_raw$player), "\n")
+cat("Year range:     ", min(df_trends_raw$year), "–", max(df_trends_raw$year), "\n")
+cat("\nNA counts:\n")
+df_trends_raw %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "n_missing") %>%
+  filter(n_missing > 0) %>%
+  print()
+```
+
+```{r range-check-trends}
+df_trends_raw %>%
+  summarise(
+    accuracy_out_of_range = sum(accuracy < 0 | accuracy > 100, na.rm = TRUE),
+    distance_out_of_range = sum(distance < 200 | distance > 350, na.rm = TRUE)
+  ) %>%
+  print()
+```
+
+---
+
+# 3. Clean df_complete
+
+## 3.1 Column names and types
+
+```{r clean-colnames}
+df_clean <- df_raw %>%
+  # Fix column name with space
+  rename(rookie_year = `rookie year`) %>%
+  # Ensure player_name is character, year is integer
+  mutate(
+    player_name = as.character(player_name),
+    year        = as.integer(year)
+  )
+
+# Confirm rename worked
+names(df_clean)
+```
+
+## 3.2 Handle the pre-2007 speed data gap
+
+Ball speed, CHS, and carry distance have ~594 NAs concentrated in 2004–2006,
+before these metrics were tracked by ShotLink. We do not impute these values.
+Instead we document the gap and note the effective start year for speed analyses.
+
+```{r speed-na-check}
+df_clean %>%
+  group_by(year) %>%
+  summarise(
+    n             = n(),
+    na_ball_speed = sum(is.na(ball_speed)),
+    na_chs        = sum(is.na(chs)),
+    na_carry      = sum(is.na(carry_distance))
+  ) %>%
+  filter(na_ball_speed > 0) %>%
+  print()
+```
+
+The `SPEED_ERA_START` constant in `config.R` is set to `2007`. Any analysis
+involving ball speed or CHS should filter to `year >= SPEED_ERA_START`.
+
+## 3.2b Missing rookie_year / turned_pro
+
+As with the speed metrics, we do not impute these — we document the gap and
+carry the NAs through into any variable derived from them.
+
+```{r rookie-year-na-check}
+missing_rookie_year <- df_clean %>%
+  filter(is.na(rookie_year))
+
+cat("Rows missing rookie_year:   ", nrow(missing_rookie_year), "\n")
+cat("Players missing rookie_year:", n_distinct(missing_rookie_year$player_name), "\n")
+cat("Rows missing turned_pro:    ", sum(is.na(df_clean$turned_pro)), "\n")
+```
+
+Because `rookie_year` is missing for all of a given player's rows rather
+than sporadically within a player's history, `years_on_tour` (section 4.1)
+will be NA for every row belonging to these players. Similarly, the single
+row with missing `turned_pro` will have an NA `cohort` (section 4.1). No
+imputation is applied; any analysis that depends on `years_on_tour` or
+`cohort` should be aware these players/rows will be excluded via NA
+propagation rather than explicitly filtered.
+
+## 3.3 Minimum seasons filter
+
+Players appearing in fewer than `MIN_SEASONS` (2) seasons are excluded from
+longitudinal analyses. We flag rather than drop them here, preserving the
+option to include single-season players in purely cross-sectional work.
+
+```{r min-seasons}
+seasons_per_player <- df_clean %>%
+  count(player_name, name = "n_seasons")
+
+df_clean <- df_clean %>%
+  left_join(seasons_per_player, by = "player_name") %>%
+  mutate(multi_season = n_seasons >= MIN_SEASONS)
+
+cat("Players with 1 season only: ",
+    sum(seasons_per_player$n_seasons < MIN_SEASONS), "\n")
+cat("Players with 2+ seasons:    ",
+    sum(seasons_per_player$n_seasons >= MIN_SEASONS), "\n")
+```
+
+---
+
+# 4. Engineer Variables — df_complete
+
+## 4.1 Career and cohort variables
+
+```{r career-vars}
+df_clean <- df_clean %>%
+  mutate(
+    # Years on tour (from rookie year)
+    years_on_tour = year - rookie_year,
+
+    # Entry cohort by decade turned pro
+    cohort = case_when(
+      turned_pro < 2000              ~ "pre-2000",
+      turned_pro >= 2000 & turned_pro < 2010 ~ "2000–2009",
+      turned_pro >= 2010 & turned_pro < 2020 ~ "2010–2019",
+      turned_pro >= 2020             ~ "2020+",
+      TRUE                           ~ NA_character_
+    ) %>% factor(levels = c("pre-2000", "2000–2009", "2010–2019", "2020+"))
+  )
+
+df_clean %>%
+  count(cohort) %>%
+  print()
+```
+
+## 4.2 Field-relative metrics (within-year centering)
+
+These express each player's stats relative to the season average — removing
+the secular trend so we can compare players across eras.
+
+```{r field-relative}
+df_clean <- df_clean %>%
+  group_by(year) %>%
+  mutate(
+    dist_vs_field  = distance   - mean(distance,   na.rm = TRUE),
+    acc_vs_field   = accuracy   - mean(accuracy,   na.rm = TRUE),
+    speed_vs_field = ball_speed - mean(ball_speed, na.rm = TRUE),
+    chs_vs_field   = chs        - mean(chs,        na.rm = TRUE)
+  ) %>%
+  ungroup()
+```
+
+## 4.3 Mundlak decomposition variables
+
+The Mundlak approach separates the *between-player* effect of distance
+(do longer hitters systematically differ from shorter hitters?) from the
+*within-player* effect (does a player improve when their own distance
+increases?). This is critical for correctly interpreting panel models.
+
+```{r mundlak}
+df_clean <- df_clean %>%
+  group_by(player_name) %>%
+  mutate(
+    # Career-average distance for each player (between-player component)
+    dist_player_mean = mean(distance, na.rm = TRUE),
+
+    # Deviation from own career average (within-player component)
+    dist_within = distance - dist_player_mean
+  ) %>%
+  ungroup()
+```
+
+## 4.4 Distance quintiles (within each year)
+
+Players ranked into five equal groups within each season. Q1 = shortest,
+Q5 = longest.
+
+```{r quintiles}
+df_clean <- df_clean %>%
+  group_by(year) %>%
+  mutate(
+    dist_quintile = ntile(distance, 5)
+  ) %>%
+  ungroup()
+
+# Verify distribution is roughly even
+df_clean %>%
+  count(dist_quintile) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  print()
+```
+
+## 4.5 Player archetype (quadrant classification)
+
+Based on whether a player is above or below the season average in both
+distance and accuracy. Simple, interpretable, and robust to year-over-year
+changes in absolute values.
+
+```{r archetypes}
+df_clean <- df_clean %>%
+  mutate(
+    archetype = case_when(
+      dist_vs_field >= 0 & acc_vs_field >= 0 ~ "Long / Accurate",
+      dist_vs_field >= 0 & acc_vs_field <  0 ~ "Long / Inaccurate",
+      dist_vs_field <  0 & acc_vs_field >= 0 ~ "Short / Accurate",
+      dist_vs_field <  0 & acc_vs_field <  0 ~ "Short / Inaccurate",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c(
+      "Long / Accurate", "Long / Inaccurate",
+      "Short / Accurate", "Short / Inaccurate"
+    ))
+  )
+
+df_clean %>%
+  count(archetype) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  print()
+```
+
+## 4.6 Career entry distance
+
+Each player's distance in their first observed season. Used in survival
+analysis and rising floor analyses to ask "what did you arrive with?"
+
+```{r entry-distance}
+entry_stats <- df_clean %>%
+  group_by(player_name) %>%
+  slice_min(year, n = 1, with_ties = FALSE) %>%
+  select(player_name, dist_entry = distance, speed_entry = ball_speed,
+         chs_entry = chs, entry_year = year) %>%
+  ungroup()
+
+df_clean <- df_clean %>%
+  left_join(entry_stats, by = "player_name")
+
+# Quick check
+df_clean %>%
+  select(player_name, year, distance, dist_entry, entry_year) %>%
+  filter(player_name == first(player_name)) %>%
+  print()
+```
+
+## 4.7 Distance quartile at career entry
+
+Used in survival analysis as a time-fixed predictor — what distance
+tier did a player arrive in?
+
+```{r entry-quartile}
+# Quartile within entry year's field
+entry_quartiles <- df_clean %>%
+  filter(year == entry_year) %>%
+  group_by(year) %>%
+  mutate(dist_entry_quartile = ntile(distance, 4)) %>%
+  ungroup() %>%
+  select(player_name, dist_entry_quartile)
+
+df_clean <- df_clean %>%
+  left_join(entry_quartiles, by = "player_name")
+
+df_clean %>%
+  count(dist_entry_quartile) %>%
+  print()
+```
+
+---
+
+# 5. Clean and Engineer df_trends
+
+## 5.1 Standardise column names
+
+```{r trends-clean}
+df_trends <- df_trends_raw %>%
+  rename(player_name = player) %>%
+  mutate(
+    player_name = as.character(player_name),
+    year        = as.integer(year)
+  )
+```
+
+## 5.2 Minimum seasons filter
+
+```{r trends-min-seasons}
+seasons_trends <- df_trends %>%
+  count(player_name, name = "n_seasons")
+
+df_trends <- df_trends %>%
+  left_join(seasons_trends, by = "player_name") %>%
+  mutate(multi_season = n_seasons >= MIN_SEASONS)
+
+cat("Players with 1 season only: ",
+    sum(seasons_trends$n_seasons < MIN_SEASONS), "\n")
+cat("Players with 2+ seasons:    ",
+    sum(seasons_trends$n_seasons >= MIN_SEASONS), "\n")
+```
+
+## 5.3 Verify and standardise field-relative metrics
+
+The raw file already contains `relative_distance` and `relative_accuracy`
+(player value minus season mean). We verify these match our own calculation
+and rename to match the `df_main` convention.
+
+```{r trends-relative}
+# Recalculate to verify
+df_trends <- df_trends %>%
+  group_by(year) %>%
+  mutate(
+    dist_vs_field_check = distance - mean(distance, na.rm = TRUE),
+    acc_vs_field_check  = accuracy - mean(accuracy, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# Compare to existing columns (should be near zero difference)
+df_trends %>%
+  summarise(
+    dist_diff_max = max(abs(relative_distance - dist_vs_field_check), na.rm = TRUE),
+    acc_diff_max  = max(abs(relative_accuracy - acc_vs_field_check),  na.rm = TRUE)
+  ) %>%
+  print()
+
+# Rename to standard convention and drop check columns
+df_trends <- df_trends %>%
+  rename(
+    dist_vs_field = relative_distance,
+    acc_vs_field  = relative_accuracy
+  ) %>%
+  select(-dist_vs_field_check, -acc_vs_field_check)
+```
+
+## 5.4 Add cohort variable
+
+```{r trends-cohort}
+# For trends file we don't have turned_pro directly, so derive from
+# first observed year as a proxy for cohort grouping
+first_year_trends <- df_trends %>%
+  group_by(player_name) %>%
+  summarise(first_year = min(year)) %>%
+  ungroup()
+
+df_trends <- df_trends %>%
+  left_join(first_year_trends, by = "player_name") %>%
+  mutate(
+    cohort = case_when(
+      first_year < 2000              ~ "pre-2000",
+      first_year >= 2000 & first_year < 2010 ~ "2000–2009",
+      first_year >= 2010 & first_year < 2020 ~ "2010–2019",
+      first_year >= 2020             ~ "2020+",
+      TRUE                           ~ NA_character_
+    ) %>% factor(levels = c("pre-2000", "2000–2009", "2010–2019", "2020+"))
+  )
+```
+
+---
+
+# 6. Final Checks
+
+## 6.1 df_main summary
+
+```{r final-check-main}
+cat("=== df_main ===\n")
+cat("Rows:              ", nrow(df_clean), "\n")
+cat("Unique players:    ", n_distinct(df_clean$player_name), "\n")
+cat("Year range:        ", min(df_clean$year), "–", max(df_clean$year), "\n")
+cat("Engineered columns:\n")
+cat(" ", paste(c("years_on_tour", "cohort", "dist_vs_field", "acc_vs_field",
+                 "speed_vs_field", "chs_vs_field", "dist_player_mean",
+                 "dist_within", "dist_quintile", "archetype",
+                 "dist_entry", "dist_entry_quartile"), collapse = "\n  "), "\n")
+
+# Spot check a well-known player if present
+if ("Tiger Woods" %in% df_clean$player_name) {
+  df_clean %>%
+    filter(player_name == "Tiger Woods") %>%
+    select(year, distance, dist_vs_field, dist_quintile, archetype, cohort) %>%
+    print()
+}
+```
+
+## 6.2 df_trends summary
+
+```{r final-check-trends}
+cat("=== df_trends ===\n")
+cat("Rows:              ", nrow(df_trends), "\n")
+cat("Unique players:    ", n_distinct(df_trends$player_name), "\n")
+cat("Year range:        ", min(df_trends$year), "–", max(df_trends$year), "\n")
+```
+
+---
+
+# 7. Write Outputs
+
+```{r write-outputs}
+saveRDS(df_clean,  here(PATH_PROCESSED, "df_main.rds"))
+saveRDS(df_trends, here(PATH_PROCESSED, "df_trends.rds"))
+
+cat("Outputs written to data/processed/:\n")
+cat("  df_main.rds  — ", nrow(df_clean),  "rows,",
+    n_distinct(df_clean$player_name),  "players\n")
+cat("  df_trends.rds —", nrow(df_trends), "rows,",
+    n_distinct(df_trends$player_name), "players\n")
+```
+
+---
+
+# 8. Session Info
+
+```{r session-info}
+sessionInfo()
+```

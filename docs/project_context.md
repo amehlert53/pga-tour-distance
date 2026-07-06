@@ -80,8 +80,11 @@ All outputs written to `data/processed/`.
 
 ### 00 — Data Engineering (`notebooks/00_data_engineering.Rmd`)
 **Goal:** Clean raw data, engineer all derived variables, write processed outputs.
-**Outputs:** `data/processed/df_main.rds`, `data/processed/df_trends.rds`,
-`data/processed/df_survival.rds`
+**Outputs:** `data/processed/df_main.rds`, `data/processed/df_trends.rds`
+
+**Note:** `data/processed/df_survival.rds` is produced separately by
+`notebooks/00b_survival_prep.Rmd` (not yet created), once there's sufficient
+familiarity with career gap patterns to make defensible censoring decisions.
 
 ---
 
@@ -218,7 +221,7 @@ speed? Is the age of peak distance changing?
 **Question:** What physical and competitive characteristics predict career longevity?
 Has being short off the tee become a stronger predictor of career exit?
 
-**Data:** `df_survival.rds` — constructed in `00_data_engineering.Rmd`.
+**Data:** `df_survival.rds` — constructed in `00b_survival_prep.Rmd`.
 
 **Survival dataset structure:**
 - One row per player-year (start-stop format for time-varying Cox)
