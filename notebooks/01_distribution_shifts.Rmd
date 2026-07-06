@@ -1,0 +1,710 @@
+---
+title: "01 — Distribution Shifts"
+subtitle: "PGA Tour Distance & Speed Analytics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+# Overview
+
+**Question:** Has driving distance increased because the elite pulled away,
+the bottom was pushed up, or the whole distribution shifted uniformly? Has
+the field become more or less homogeneous?
+
+**Approach:** Sections 2–7 use `df_trends` (1987–2025) — the only dataset
+that spans the full transformation the question is about, and covers
+distance/accuracy without needing strokes-gained data. Sections 8–9 then
+turn to `df_main` (2004–2025) to check whether the *mechanism* behind
+rising distance — carry distance, ball speed, clubhead speed — shows the
+same pattern; those metrics only exist in the strokes-gained era, and are
+only reliable from `SPEED_ERA_START` (2007) onward.
+
+**Inputs:**
+- `data/processed/df_trends.rds` (sections 2–7)
+- `data/processed/df_main.rds` (sections 8–9)
+
+**Outputs:** Two figures saved to `figures/publication/` (300 DPI) and
+`figures/social/` (150 DPI): the percentile fan chart and the CV-over-time
+chart.
+
+---
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+# Core
+library(tidyverse)
+library(here)
+
+# Modeling
+library(quantreg)  # quantile regression (section 4)
+library(moments)   # skewness/kurtosis (section 2)
+library(transport) # 1D Wasserstein distance (section 5)
+
+# Visualization
+library(ggridges)  # ridgeline plot (section 7)
+library(patchwork)  # scatter triptych (section 6)
+library(scales)
+
+# Utilities
+library(broom)
+
+source(here::here("config.R"))
+
+set.seed(2025)
+
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+---
+
+# 2. Load Data
+
+```{r load-data}
+df_trends <- readRDS(here(PATH_PROCESSED, "df_trends.rds"))
+
+cat("Rows:          ", nrow(df_trends), "\n")
+cat("Unique players:", n_distinct(df_trends$player_name), "\n")
+cat("Year range:    ", min(df_trends$year), "-", max(df_trends$year), "\n")
+```
+
+---
+
+# 3. Descriptive Distributional Statistics
+
+Per-year mean, standard deviation, coefficient of variation (CV = SD/mean),
+IQR, skewness, and kurtosis of `distance`. CV is the key summary number
+here: it's scale-free, so it's directly comparable across years even as the
+mean distance itself rises — a rising CV means the field is *spreading
+out* relative to its own average, a falling CV means it's *homogenizing*.
+Skewness/kurtosis tell us about shape: positive skew would mean a long
+right tail of a few very long hitters; rising kurtosis would mean more mass
+concentrated with fatter tails (a more polarized field).
+
+```{r descriptive-stats}
+yearly_stats <- df_trends %>%
+  group_by(year) %>%
+  summarise(
+    n         = n(),
+    mean_dist = mean(distance, na.rm = TRUE),
+    sd_dist   = sd(distance, na.rm = TRUE),
+    cv_dist   = sd_dist / mean_dist,
+    iqr_dist  = IQR(distance, na.rm = TRUE),
+    skew_dist = moments::skewness(distance, na.rm = TRUE),
+    kurt_dist = moments::kurtosis(distance, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+yearly_stats %>% print(n = 10)
+```
+
+## 3.1 CV over time (key visual)
+
+```{r cv-over-time}
+p_cv <- ggplot(yearly_stats, aes(year, cv_dist)) +
+  geom_line(color = COL_PRIMARY, linewidth = 1) +
+  geom_point(color = COL_PRIMARY) +
+  labs(
+    title    = "Coefficient of Variation in Driving Distance",
+    subtitle = "Lower = the field is more homogeneous; higher = more spread out",
+    x = NULL, y = "CV (SD / mean)"
+  ) +
+  THEME_BASE
+
+p_cv
+```
+
+```{r cv-findings}
+cv_first     <- yearly_stats %>% filter(year == min(year)) %>% pull(cv_dist)
+cv_last      <- yearly_stats %>% filter(year == max(year)) %>% pull(cv_dist)
+cv_peak_year <- yearly_stats %>% filter(cv_dist == max(cv_dist)) %>% pull(year)
+cv_peak      <- max(yearly_stats$cv_dist)
+skew_first   <- yearly_stats %>% filter(year == min(year)) %>% pull(skew_dist)
+skew_last    <- yearly_stats %>% filter(year == max(year)) %>% pull(skew_dist)
+```
+
+**Finding:** CV moved from `r round(cv_first, 3)` (1987) to `r round(cv_last, 3)`
+(2025), peaking at `r round(cv_peak, 3)` in `r cv_peak_year` — right around
+the ball/equipment transition in section 4. Despite average distance rising
+by dozens of yards, relative spread is close to flat over the full window:
+the field hasn't meaningfully fragmented, though it did widen temporarily
+during the transition before settling back down. Skewness flipped from
+slightly positive (`r round(skew_first, 2)` in 1987, a small right tail of
+long hitters) to slightly negative (`r round(skew_last, 2)` in 2025, a small
+left tail of short hitters) — a modest shape change, not a dramatic one.
+
+---
+
+# 4. Percentile Trajectory (Signature Visual)
+
+The 10th/25th/50th/75th/90th percentile of `distance` each year. This is
+the most direct way to answer the core question: if the 90th percentile
+line rises faster than the 10th, the elite are pulling away; if the 10th
+rises faster, the competitive floor is catching up; if the bands stay a
+constant width while the whole fan shifts up, the increase is uniform
+across the field.
+
+```{r percentile-trajectory}
+percentile_trend <- df_trends %>%
+  group_by(year) %>%
+  summarise(
+    p10 = quantile(distance, 0.10, na.rm = TRUE),
+    p25 = quantile(distance, 0.25, na.rm = TRUE),
+    p50 = quantile(distance, 0.50, na.rm = TRUE),
+    p75 = quantile(distance, 0.75, na.rm = TRUE),
+    p90 = quantile(distance, 0.90, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_fan <- ggplot(percentile_trend, aes(year)) +
+  geom_ribbon(aes(ymin = p10, ymax = p90), fill = COL_PRIMARY, alpha = 0.15) +
+  geom_ribbon(aes(ymin = p25, ymax = p75), fill = COL_PRIMARY, alpha = 0.30) +
+  geom_line(aes(y = p50), color = COL_PRIMARY, linewidth = 1.1) +
+  labs(
+    title    = "Driving Distance Percentile Trajectory, 1987-2025",
+    subtitle = "Light band: 10th-90th percentile. Dark band: 25th-75th. Line: median.",
+    x = NULL, y = "Driving Distance (yards)"
+  ) +
+  THEME_BASE
+
+p_fan
+```
+
+```{r fan-chart-findings}
+pt <- percentile_trend %>% arrange(year) %>% mutate(band = p90 - p10, gain3 = p50 - lag(p50, 3))
+sharpest <- pt %>% filter(!is.na(gain3)) %>% slice_max(gain3, n = 1)
+
+band_first <- pt %>% filter(year == min(year)) %>% pull(band)
+band_last  <- pt %>% filter(year == max(year)) %>% pull(band)
+```
+
+**Finding:** the sharpest multi-year move in the whole series is centered on
+`r sharpest$year` — median distance gained `r round(sharpest$gain3, 1)`
+yards in the 3 years ending then (the Pro V1 / COR-limit transition,
+2000-2003), the steepest stretch anywhere in the data. The 10th-90th
+percentile band widened during that same transition before narrowing back
+down; by 2025 it's `r round(band_last, 1)` yards wide versus
+`r round(band_first, 1)` in 1987 — `r if (abs(band_last - band_first) < 2) "essentially the same width" else if (band_last > band_first) "modestly wider" else "modestly narrower"`,
+consistent with section 3's near-flat CV: this reads as a broad shift that
+temporarily stretched the field during the equipment transition, not a
+steady widening gap between short and long hitters.
+
+---
+
+# 5. Quantile Regression Over Time
+
+The fan chart shows *what* happened to each percentile; quantile regression
+quantifies *how fast*. We fit `distance ~ year` separately at each quantile
+(`tau`) using `quantreg::rq()` on the full player-year data (not the
+pre-aggregated yearly percentiles from section 4), which lets each
+quantile's slope reflect the underlying data directly rather than a trend
+fit to five summary points. Standard errors use the `"nid"` (non-i.i.d.)
+approximation rather than bootstrapping — appropriate here given the sample
+size per year (~180-195) and much faster to compute; the point is spotting
+whether upper and lower quantiles diverge, not thousandth-yard precision.
+
+```{r quantile-regression}
+quantile_slopes <- map_dfr(c(0.10, 0.25, 0.50, 0.75, 0.90), function(q) {
+  fit <- rq(distance ~ year, tau = q, data = df_trends)
+  s   <- summary(fit, se = "nid")
+  tibble(
+    tau   = q,
+    slope = coef(fit)[["year"]],
+    se    = s$coefficients["year", "Std. Error"]
+  )
+})
+
+quantile_slopes %>% print()
+```
+
+**Interpretation:** a bigger `slope` at `tau = 0.90` than `tau = 0.10` means
+the longest hitters are gaining yards faster than the shortest hitters —
+i.e. the elite pulling away, not a uniform shift.
+
+```{r quantile-slopes-plot}
+p_slopes <- ggplot(quantile_slopes, aes(factor(tau), slope)) +
+  geom_col(fill = COL_PRIMARY) +
+  geom_errorbar(aes(ymin = slope - 1.96 * se, ymax = slope + 1.96 * se), width = 0.15) +
+  labs(
+    title    = "Yearly Distance Gain by Quantile",
+    subtitle = "Taller bar = that part of the distribution is gaining distance faster per year",
+    x = "Quantile (tau)", y = "Yards gained per year"
+  ) +
+  THEME_BASE
+
+p_slopes
+```
+
+```{r quantile-findings}
+slope_range <- range(quantile_slopes$slope)
+```
+
+**Finding:** the slopes are nearly identical across the whole distribution
+— `r round(slope_range[1], 2)` to `r round(slope_range[2], 2)` yards/year
+from the 10th to the 90th percentile, a difference smaller than one
+standard error at either end. That's a genuinely uniform shift: every part
+of the distribution is gaining distance at essentially the same rate, not
+the elite pulling meaningfully away from the field (or vice versa).
+
+---
+
+# 6. Wasserstein Distance From a Reference Year
+
+The Wasserstein (earth-mover's) distance measures how much "work" it would
+take to reshape one year's whole distribution into another's — capturing
+shifts in shape, not just central tendency. We use 1990 as the baseline
+(early enough to represent the "old" era, but with a full, non-sparse
+sample — every year from 1987 on has ~180-195 players, so this isn't a
+small-sample artifact).
+
+```{r wasserstein}
+REFERENCE_YEAR <- 1990
+
+reference_dist <- df_trends %>%
+  filter(year == REFERENCE_YEAR) %>%
+  pull(distance)
+
+wasserstein_by_year <- df_trends %>%
+  group_by(year) %>%
+  summarise(
+    wasserstein_dist = transport::wasserstein1d(distance, reference_dist),
+    .groups = "drop"
+  )
+
+p_wasserstein <- ggplot(wasserstein_by_year, aes(year, wasserstein_dist)) +
+  geom_line(color = COL_ACCENT, linewidth = 1) +
+  geom_point(color = COL_ACCENT) +
+  geom_vline(xintercept = REFERENCE_YEAR, linetype = "dashed", color = "grey50") +
+  labs(
+    title    = paste("Distributional Drift in Driving Distance From", REFERENCE_YEAR),
+    subtitle = "1D Wasserstein distance (yards) - larger means more different from the baseline year",
+    x = NULL, y = "Wasserstein distance (yards)"
+  ) +
+  THEME_BASE
+
+p_wasserstein
+```
+
+```{r wasserstein-findings}
+w_2025 <- wasserstein_by_year %>% filter(year == max(year)) %>% pull(wasserstein_dist)
+w_peak_year <- wasserstein_by_year %>% filter(wasserstein_dist == max(wasserstein_dist)) %>% pull(year)
+```
+
+**Finding:** drift from the 1990 baseline grows almost monotonically,
+reaching `r round(w_2025, 1)` yards of Wasserstein distance by 2025 (the
+largest in the series, at `r w_peak_year`) — the distribution keeps moving
+further from its 1990 shape rather than plateauing or reverting, echoing
+the steady rise already visible in the fan chart.
+
+---
+
+# 7. Distance-Accuracy Trade-off
+
+Is hitting the ball farther still associated with hitting it less
+accurately, and has that trade-off strengthened or weakened over time? We
+use Spearman (rank) correlation rather than Pearson because we care about
+the *relationship* between relative standing on each metric, not the linear
+scale of the raw values.
+
+```{r spearman-by-year}
+spearman_by_year <- df_trends %>%
+  group_by(year) %>%
+  summarise(
+    rho = cor(distance, accuracy, method = "spearman", use = "complete.obs"),
+    .groups = "drop"
+  )
+
+p_spearman <- ggplot(spearman_by_year, aes(year, rho)) +
+  geom_line(color = COL_SECONDARY, linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(
+    title    = "Distance-Accuracy Trade-off Over Time",
+    subtitle = "Spearman correlation between distance rank and accuracy rank each year",
+    x = NULL, y = "Spearman's rho"
+  ) +
+  THEME_BASE
+
+p_spearman
+```
+
+```{r spearman-findings}
+rho_first <- spearman_by_year %>% filter(year == min(year)) %>% pull(rho)
+rho_last  <- spearman_by_year %>% filter(year == max(year)) %>% pull(rho)
+rho_early_avg <- spearman_by_year %>% filter(year <= min(year) + 9) %>% summarise(m = mean(rho)) %>% pull(m)
+rho_late_avg  <- spearman_by_year %>% filter(year >= max(year) - 9) %>% summarise(m = mean(rho)) %>% pull(m)
+```
+
+**Finding:** the trade-off has *strengthened*, not weakened — Spearman's
+rho moved from `r round(rho_first, 2)` in 1987 to `r round(rho_last, 2)` in
+2025 (decade averages: `r round(rho_early_avg, 2)` in the first 10 years vs.
+`r round(rho_late_avg, 2)` in the most recent 10). Longer hitters today give
+up relatively more accuracy than longer hitters did in the late 1980s —
+distance gains haven't come for free.
+
+## 7.1 Scatter triptych: three eras
+
+Three representative years spanning the dataset, to see the trade-off
+directly rather than through a single summary statistic.
+
+```{r scatter-triptych}
+triptych_years <- c(1990, 2008, 2025)
+
+triptych_plots <- map(triptych_years, function(yr) {
+  df_trends %>%
+    filter(year == yr) %>%
+    ggplot(aes(distance, accuracy)) +
+    geom_point(alpha = 0.5, color = COL_PRIMARY) +
+    geom_smooth(method = "lm", se = FALSE, color = COL_ACCENT, linewidth = 0.8) +
+    labs(title = as.character(yr), x = "Distance (yds)", y = "Accuracy (%)") +
+    THEME_BASE
+})
+
+wrap_plots(triptych_plots, nrow = 1) +
+  plot_annotation(title = "Distance vs. Accuracy: Three Eras")
+```
+
+**Finding:** the downward-sloping fitted line visibly steepens from 1990 to
+2025, a direct visual confirmation of the strengthening trade-off quantified
+above.
+
+---
+
+# 8. Ridgeline Plot
+
+A distributional complement to the fan chart in section 4 — every 5th year,
+plus 2025 to include the most recent season.
+
+```{r ridgeline}
+ridge_years <- seq(1987, 2025, by = 5)
+if (!2025 %in% ridge_years) ridge_years <- c(ridge_years, 2025)
+
+p_ridge <- df_trends %>%
+  filter(year %in% ridge_years) %>%
+  ggplot(aes(x = distance, y = factor(year), fill = after_stat(x))) +
+  geom_density_ridges_gradient(scale = 2, rel_min_height = 0.01) +
+  scale_fill_viridis_c(name = "Distance", option = "C") +
+  labs(
+    title = "Driving Distance Distribution by Era",
+    x = "Distance (yards)", y = NULL
+  ) +
+  THEME_BASE +
+  theme(legend.position = "right")
+
+p_ridge
+```
+
+**Finding:** the ridges shift steadily right with each successive era and
+show the same pattern as the fan chart — a fairly clean rightward slide
+rather than one ridge developing a visibly different shape (extra bumps,
+elongated tails) from its neighbors. The most visible "jump" between
+adjacent ridges is 1997→2002, consistent with the 2000-2003 transition
+already identified in section 4.
+
+---
+
+# 9. Speed-Era Distributional Trends (`df_main`)
+
+The sections above show *that* distance increased and *how* it was
+distributed. This section checks whether the metrics behind the distance
+gain — carry distance, ball speed, clubhead speed (CHS) — moved the same
+way, using `df_main` filtered to `year >= SPEED_ERA_START`. We reuse the
+`SPEED_ERA_START` constant from `config.R` (2007) rather than hardcoding
+it, since it's already the documented cutoff for when these metrics became
+reliable (see `00_data_engineering.Rmd` section 3.2 — 2004-2006 rows are
+NA). This is a different source dataset from sections 2-8 (`df_main`, not
+`df_trends`), so results aren't directly overlaid until section 10, where
+we put everything on a common index.
+
+```{r load-df-main}
+df_main <- readRDS(here(PATH_PROCESSED, "df_main.rds"))
+
+df_speed <- df_main %>%
+  filter(year >= SPEED_ERA_START)
+
+cat("Rows (", SPEED_ERA_START, "-2025):", nrow(df_speed), "\n")
+cat("Unique players:                  ", n_distinct(df_speed$player_name), "\n")
+```
+
+## 9.1 Per-year mean and CV
+
+```{r speed-descriptive-stats}
+speed_yearly_stats <- df_speed %>%
+  group_by(year) %>%
+  summarise(
+    across(
+      c(carry_distance, ball_speed, chs),
+      list(mean = ~mean(.x, na.rm = TRUE), cv = ~sd(.x, na.rm = TRUE) / mean(.x, na.rm = TRUE)),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+
+speed_yearly_stats %>% print(n = 10)
+```
+
+```{r speed-descriptive-findings}
+speed_first <- speed_yearly_stats %>% filter(year == min(year))
+speed_last  <- speed_yearly_stats %>% filter(year == max(year))
+```
+
+**Finding:** all three rose over `r min(speed_yearly_stats$year)`-`r max(speed_yearly_stats$year)`:
+carry distance `r round(speed_first$carry_distance_mean, 1)` → `r round(speed_last$carry_distance_mean, 1)` yds
+(+`r round(speed_last$carry_distance_mean - speed_first$carry_distance_mean, 1)`),
+ball speed `r round(speed_first$ball_speed_mean, 1)` → `r round(speed_last$ball_speed_mean, 1)` mph
+(+`r round(speed_last$ball_speed_mean - speed_first$ball_speed_mean, 1)`),
+clubhead speed `r round(speed_first$chs_mean, 1)` → `r round(speed_last$chs_mean, 1)` mph
+(+`r round(speed_last$chs_mean - speed_first$chs_mean, 1)`). Directionally
+consistent with the overall distance trend, but section 10 checks whether
+the *rates* of increase actually line up.
+
+## 9.2 Percentile trajectories
+
+A lighter version of section 4's fan chart (median + IQR band only, not
+the full 10th-90th treatment) across all three speed-era metrics at once,
+to keep the notebook focused rather than repeating every section 2-8
+analysis three more times.
+
+```{r speed-percentile-trajectory}
+speed_percentiles <- df_speed %>%
+  select(year, carry_distance, ball_speed, chs) %>%
+  pivot_longer(cols = c(carry_distance, ball_speed, chs), names_to = "metric", values_to = "value") %>%
+  group_by(year, metric) %>%
+  summarise(
+    p25 = quantile(value, 0.25, na.rm = TRUE),
+    p50 = quantile(value, 0.50, na.rm = TRUE),
+    p75 = quantile(value, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+metric_labels <- c(
+  carry_distance = "Carry Distance (yds)",
+  ball_speed     = "Ball Speed (mph)",
+  chs            = "Clubhead Speed (mph)"
+)
+
+p_speed_trends <- ggplot(speed_percentiles, aes(year)) +
+  geom_ribbon(aes(ymin = p25, ymax = p75), fill = COL_SECONDARY, alpha = 0.3) +
+  geom_line(aes(y = p50), color = COL_SECONDARY, linewidth = 1) +
+  facet_wrap(~metric, scales = "free_y", labeller = as_labeller(metric_labels)) +
+  labs(
+    title    = paste0("Speed-Era Metrics, ", SPEED_ERA_START, "-2025"),
+    subtitle = "Band: 25th-75th percentile. Line: median.",
+    x = NULL, y = NULL
+  ) +
+  THEME_BASE
+
+p_speed_trends
+```
+
+**Finding:** all three panels trend upward across the window with no sharp
+break comparable to the 2000-2003 distance/accuracy transition — the
+strokes-gained era doesn't cover the equipment-change period, so this
+section only sees the more gradual, recent phase of the buildup.
+
+---
+
+# 10. Are Distance, Carry Distance, Ball Speed, and CHS Moving Together?
+
+If all four metrics move in lockstep, that points to a common driver
+(equipment, athleticism, training). If they diverge — say distance rises
+faster than ball speed — the distance gain isn't purely a speed story
+(e.g. course setup, launch conditions, or measurement changes could be
+contributing too). We index each metric to its `SPEED_ERA_START` value
+(each year as a % of the 2007 mean) so metrics on very different natural
+scales (yards vs. mph) are visually comparable. `distance` is recomputed
+here from `df_main` over the same 2007-2025 window used for the other three
+— not the full 1987-2025 range from section 4 — so the comparison is
+apples-to-apples across a shared time window and data source.
+
+```{r index-trend}
+index_base <- df_speed %>%
+  filter(year == SPEED_ERA_START) %>%
+  summarise(
+    distance       = mean(distance, na.rm = TRUE),
+    carry_distance = mean(carry_distance, na.rm = TRUE),
+    ball_speed     = mean(ball_speed, na.rm = TRUE),
+    chs            = mean(chs, na.rm = TRUE)
+  )
+
+index_trend <- df_speed %>%
+  group_by(year) %>%
+  summarise(
+    distance       = mean(distance, na.rm = TRUE),
+    carry_distance = mean(carry_distance, na.rm = TRUE),
+    ball_speed     = mean(ball_speed, na.rm = TRUE),
+    chs            = mean(chs, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    distance       = 100 * distance / index_base$distance,
+    carry_distance = 100 * carry_distance / index_base$carry_distance,
+    ball_speed     = 100 * ball_speed / index_base$ball_speed,
+    chs            = 100 * chs / index_base$chs
+  ) %>%
+  pivot_longer(-year, names_to = "metric", values_to = "index")
+
+metric_series_labels <- c(
+  distance = "Distance", carry_distance = "Carry Distance",
+  ball_speed = "Ball Speed", chs = "Clubhead Speed"
+)
+
+p_index <- ggplot(index_trend, aes(year, index, color = metric)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  geom_hline(yintercept = 100, linetype = "dashed", color = "grey50") +
+  scale_color_manual(
+    values = c(distance = COL_PRIMARY, carry_distance = COL_SECONDARY,
+               ball_speed = COL_ACCENT, chs = COL_NEUTRAL),
+    labels = metric_series_labels
+  ) +
+  labs(
+    title    = paste0("Indexed Trends Since ", SPEED_ERA_START, " (", SPEED_ERA_START, " = 100)"),
+    subtitle = "Do distance, carry distance, ball speed, and clubhead speed move together?",
+    x = NULL, y = "Index", color = NULL
+  ) +
+  THEME_BASE
+
+p_index
+```
+
+```{r index-findings}
+index_2025 <- index_trend %>% filter(year == max(year))
+idx <- setNames(index_2025$index, index_2025$metric)
+```
+
+**Finding:** by 2025, carry distance leads at index
+`r round(idx[["carry_distance"]], 1)`, ahead of distance
+(`r round(idx[["distance"]], 1)`) and ball speed
+(`r round(idx[["ball_speed"]], 1)`), with clubhead speed lagging furthest
+behind at `r round(idx[["chs"]], 1)`. They're all rising together in broad
+strokes, but carry distance is pulling ahead of the pure speed metrics —
+something beyond clubhead speed alone (ball/course conditions, launch
+optimization) is contributing to the recent carry-distance gain.
+
+## 10.1 Correlation of year-over-year % changes
+
+A secondary, numeric check on the same question: do the four metrics'
+year-over-year swings correlate with each other?
+
+```{r yoy-correlation}
+yoy_changes <- df_speed %>%
+  group_by(year) %>%
+  summarise(
+    distance       = mean(distance, na.rm = TRUE),
+    carry_distance = mean(carry_distance, na.rm = TRUE),
+    ball_speed     = mean(ball_speed, na.rm = TRUE),
+    chs            = mean(chs, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(year) %>%
+  mutate(across(-year, ~ (.x / lag(.x) - 1) * 100, .names = "{.col}_pct_chg")) %>%
+  select(year, ends_with("pct_chg")) %>%
+  drop_na()
+
+yoy_changes %>%
+  select(-year) %>%
+  cor() %>%
+  round(2) %>%
+  print()
+```
+
+```{r yoy-findings}
+yoy_cor <- yoy_changes %>% select(-year) %>% cor()
+```
+
+**Finding:** a real nuance the index chart alone doesn't show. Ball speed
+and CHS year-over-year swings correlate strongly with each other
+(r = `r round(yoy_cor["ball_speed_pct_chg", "chs_pct_chg"], 2)`, as
+physically expected — faster swings produce faster ball speed), and carry
+distance correlates moderately with both
+(r ≈ `r round(mean(c(yoy_cor["carry_distance_pct_chg","ball_speed_pct_chg"], yoy_cor["carry_distance_pct_chg","chs_pct_chg"])), 2)`).
+But total driving distance's year-to-year wiggle barely correlates with any
+of them
+(r = `r round(yoy_cor["distance_pct_chg","ball_speed_pct_chg"], 2)` vs. ball
+speed, `r round(yoy_cor["distance_pct_chg","chs_pct_chg"], 2)` vs. CHS).
+So while the *levels* all trend up together over the long run (section 10),
+season-to-season *fluctuations* in average driving distance are driven by
+something other than that season's speed metrics — course rotation,
+weather, or driving strategy are more likely candidates than swing
+mechanics for the year-to-year noise.
+
+---
+
+# 11. Summary
+
+```{r summary-numbers}
+dist_1987 <- percentile_trend %>% filter(year == min(year)) %>% pull(p50)
+dist_2025 <- percentile_trend %>% filter(year == max(year)) %>% pull(p50)
+
+slope_p10 <- quantile_slopes %>% filter(tau == 0.10) %>% pull(slope)
+slope_p90 <- quantile_slopes %>% filter(tau == 0.90) %>% pull(slope)
+
+cv_1987 <- yearly_stats %>% filter(year == min(year)) %>% pull(cv_dist)
+cv_2025 <- yearly_stats %>% filter(year == max(year)) %>% pull(cv_dist)
+```
+
+- Median driving distance rose from **`r round(dist_1987, 1)`** yards in
+  1987 to **`r round(dist_2025, 1)`** yards in 2025 — but this is a **broadly
+  uniform shift, not the elite pulling away**: quantile regression slopes
+  are nearly identical across the distribution
+  (**`r round(slope_p10, 2)`**-**`r round(slope_p90, 2)`** yards/year from
+  the 10th to 90th percentile, a gap smaller than one standard error), and
+  CV is essentially flat (**`r round(cv_1987, 3)`** → **`r round(cv_2025, 3)`**).
+  The field hasn't stratified — everyone gained distance at roughly the
+  same rate.
+- The one clear exception to "uniform" is the *timing*: nearly all of the
+  gain is concentrated in a single sharp jump around 2000-2003 (the
+  Pro V1/COR-limit transition — see section 4), with more gradual
+  increases before and after.
+- The distance-accuracy trade-off has **strengthened**, not weakened or
+  stayed flat (section 7) — longer hitters today give up relatively more
+  accuracy than longer hitters did in the late 1980s.
+- Sections 9-10 corroborate the overall rise using carry distance, ball
+  speed, and clubhead speed (2007-2025) — but with a genuine wrinkle: the
+  four metrics' *levels* trend up together, while their *year-to-year
+  fluctuations* barely correlate (section 10.1), and carry distance is
+  pulling ahead of the pure speed metrics rather than moving in lockstep
+  with them (section 10). Distance gains aren't purely a swing-speed story.
+
+---
+
+# 12. Save Figures
+
+Per the project conventions in `docs/project_context.md`: 300 DPI to
+`figures/publication/`, 150 DPI to `figures/social/`. Saving the two
+headline visuals — the percentile fan chart and the CV chart.
+
+```{r save-figures}
+ggsave(here(PATH_FIGURES, "publication", "01_percentile_fan_chart.png"),
+       p_fan, width = 10, height = 6, dpi = 300)
+ggsave(here(PATH_FIGURES, "social", "01_percentile_fan_chart.png"),
+       p_fan, width = 10, height = 6, dpi = 150)
+
+ggsave(here(PATH_FIGURES, "publication", "01_cv_over_time.png"),
+       p_cv, width = 10, height = 6, dpi = 300)
+ggsave(here(PATH_FIGURES, "social", "01_cv_over_time.png"),
+       p_cv, width = 10, height = 6, dpi = 150)
+
+cat("Figures saved to figures/publication/ and figures/social/\n")
+```
+
+---
+
+# 13. Session Info
+
+```{r session-info}
+sessionInfo()
+```

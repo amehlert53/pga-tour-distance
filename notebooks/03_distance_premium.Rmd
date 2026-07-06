@@ -1,0 +1,464 @@
+---
+title: "03 — The Distance Premium"
+subtitle: "PGA Tour Distance & Speed Analytics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+# Overview
+
+**Question:** Has the relationship between driving distance and
+competitive success (SG_total) strengthened over time?
+
+**Data:** `df_main` (2004–2025, strokes-gained era).
+
+**A preview of what's coming, so the individual sections make sense in
+context:** the simplest year-by-year metrics here (Spearman correlation,
+annual regression slope) are noisy and non-monotonic — they don't cleanly
+answer the question on their own. A pooled mixed-effects model (section 6)
+resolves it: yes, the premium has strengthened, and by a lot (roughly
+tripled over the window). We show the noisy simple metrics anyway, because
+part of the noise itself turns out to be explained by something real (how
+"bunched up" the field's distances were in a given year — section 2), and
+because the more granular distance-quintile comparison (section 5) gives
+an independent, cleaner confirmation of the same trend.
+
+---
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+# Core
+library(tidyverse)
+library(here)
+
+# Modeling
+library(lme4)         # mixed-effects interaction model (section 6)
+
+# Visualization
+library(patchwork)    # scatter triptych (section 8)
+library(scales)
+
+# Utilities
+library(broom)
+library(broom.mixed)  # tidy() for lmer objects
+
+source(here::here("config.R"))
+
+set.seed(2025)
+
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+---
+
+# 2. Load Data
+
+```{r load-data}
+df_main <- readRDS(here(PATH_PROCESSED, "df_main.rds"))
+
+cat("Rows:          ", nrow(df_main), "\n")
+cat("Unique players:", n_distinct(df_main$player_name), "\n")
+cat("Year range:    ", min(df_main$year), "-", max(df_main$year), "\n")
+```
+
+## 2.1 Two quick data checks before analyzing
+
+None of the columns used in this notebook have missing values, and
+`sg_total` should equal the sum of its four components — worth confirming
+rather than assuming, since a real discrepancy would undermine section 4's
+component-importance analysis.
+
+```{r data-checks}
+key_cols <- c("sg_total", "distance", "dist_vs_field", "dist_quintile",
+              "sg_ott", "sg_apr", "sg_arg", "sg_putt", "age")
+na_counts <- colSums(is.na(df_main[key_cols]))
+cat("NA counts in key columns:\n")
+print(na_counts[na_counts > 0])
+if (all(na_counts == 0)) cat("(none - all zero)\n")
+
+sg_diff <- df_main$sg_total - (df_main$sg_ott + df_main$sg_apr + df_main$sg_arg + df_main$sg_putt)
+cat("\nsg_total vs. sum of 4 components - max abs difference:", round(max(abs(sg_diff)), 3), "\n")
+cat("Rows differing by more than 0.2:", sum(abs(sg_diff) > 0.2), "of", nrow(df_main), "\n")
+```
+
+**Finding:** zero missing values in any column used here. `sg_total` is
+essentially, but not exactly, the sum of its four components (max
+discrepancy `r round(max(abs(sg_diff)), 3)`, and only
+`r sum(abs(sg_diff) > 0.2)` of `r nrow(df_main)` rows differ by more than
+0.2) — clearly just rounding in the source data, not a real data-quality
+problem. Safe to treat `sg_total` as the sum of the four components for
+section 4's variance-decomposition purposes.
+
+---
+
+# 3. Year-by-Year Correlation: Distance vs. SG_total
+
+The most direct test of "does hitting it farther associate with playing
+better" in a given season. We use Spearman (rank) correlation as the
+headline metric since it doesn't assume a linear relationship — but before
+treating it as the primary metric, it's worth checking whether using ranks
+instead of actual yardage changes the picture, particularly in years where
+the field's distances might be more tightly bunched together.
+
+```{r yearly-correlation}
+yearly_corr <- df_main %>%
+  group_by(year) %>%
+  summarise(
+    spearman_rho     = cor(distance, sg_total, method = "spearman", use = "complete.obs"),
+    pearson_raw_dist = cor(distance, sg_total, method = "pearson", use = "complete.obs"),
+    pearson_relative = cor(dist_vs_field, sg_total, method = "pearson", use = "complete.obs"),
+    sd_distance      = sd(distance, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+yearly_corr %>% print(n = 10)
+```
+
+## 3.1 Does rank vs. magnitude change the story?
+
+```{r rank-vs-magnitude-check}
+cat("Pearson (raw distance) vs. Pearson (relative distance) - should be identical:\n")
+cat("Max difference:", max(abs(yearly_corr$pearson_raw_dist - yearly_corr$pearson_relative)), "\n\n")
+
+cat("Correlation between Spearman and Pearson series across years:\n")
+cat(round(cor(yearly_corr$spearman_rho, yearly_corr$pearson_raw_dist), 3), "\n\n")
+
+cat("Correlation between a year's distance SPREAD and that year's Spearman rho:\n")
+cat(round(cor(yearly_corr$sd_distance, yearly_corr$spearman_rho), 3), "\n")
+```
+
+```{r yearly-correlation-plot}
+p_yearly_corr <- ggplot(yearly_corr, aes(year, spearman_rho)) +
+  geom_line(color = COL_PRIMARY, linewidth = 1) +
+  geom_point(color = COL_PRIMARY) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(
+    title    = "Distance-SG_total Correlation by Year",
+    subtitle = "Spearman rank correlation, distance vs. season strokes-gained total",
+    x = NULL, y = "Spearman's rho"
+  ) +
+  THEME_BASE
+
+p_yearly_corr
+```
+
+**Finding:** this series is noisy and non-monotonic, not a clean rising
+trend — from `r round(yearly_corr$spearman_rho[1], 2)` in
+`r yearly_corr$year[1]` up to a peak of
+`r round(max(yearly_corr$spearman_rho), 2)` in
+`r yearly_corr$year[which.max(yearly_corr$spearman_rho)]`, then back down to
+`r round(yearly_corr$spearman_rho[yearly_corr$year == 2024], 2)` in 2024. Two
+things worth separating out: (1) using raw distance or field-relative
+distance gives *mathematically identical* Pearson correlations within each
+year (relative distance is just raw distance shifted by a constant, and
+Pearson correlation is invariant to shifts) — confirmed above, max
+difference is exactly 0. (2) Spearman and Pearson are 0.98 correlated
+across years, so rank-vs-magnitude isn't why the series is noisy. But a
+year's distance *spread* (SD) correlates 0.42 with that year's rho — years
+where the field's distances are more compressed genuinely do show a weaker
+relationship, regardless of how it's measured. That's a real, partial
+explanation for the noise here, and another reason to lean on the pooled
+model in section 6 rather than any single year's number.
+
+---
+
+# 4. Annual R²: SG_total ~ SG_OTT
+
+How much of the variation in total performance does off-the-tee play (the
+component distance most directly feeds) explain, and has that grown?
+
+```{r annual-r2-ott}
+r2_by_year <- df_main %>%
+  group_by(year) %>%
+  summarise(r2 = summary(lm(sg_total ~ sg_ott))$r.squared, .groups = "drop")
+
+p_r2 <- ggplot(r2_by_year, aes(year, r2)) +
+  geom_line(color = COL_SECONDARY, linewidth = 1) +
+  geom_point(color = COL_SECONDARY) +
+  labs(
+    title    = "How Much Does Off-the-Tee Play Explain Total Performance?",
+    subtitle = "R² from SG_total ~ SG_OTT, fit separately each year",
+    x = NULL, y = expression(R^2)
+  ) +
+  THEME_BASE
+
+p_r2
+```
+
+**Finding:** R² ranges from
+`r round(min(r2_by_year$r2), 2)` (`r r2_by_year$year[which.min(r2_by_year$r2)]`)
+to `r round(max(r2_by_year$r2), 2)` (`r r2_by_year$year[which.max(r2_by_year$r2)]`),
+noisy like section 3 but with a visible tilt: the pre-2012 years mostly sit
+below 0.3, while 2016 onward mostly sit above 0.3 — off-the-tee play
+explains a somewhat larger share of who plays well in the more recent
+strokes-gained era than it did at the start of it.
+
+---
+
+# 5. SG Component Importance (Standardized Betas)
+
+Since `sg_total` is essentially the sum of its four components (section
+2.1), regressing it on all four **will** produce R² close to 1 by
+construction — that's expected, not a modeling success. The informative
+part is the *relative size* of the four standardized betas: which
+component of the game actually drives the variation in total score, and
+has that mix shifted toward off-the-tee (where distance lives)?
+
+```{r component-importance}
+beta_by_year <- df_main %>%
+  group_by(year) %>%
+  mutate(across(c(sg_ott, sg_apr, sg_arg, sg_putt), ~as.numeric(scale(.x)), .names = "z_{.col}")) %>%
+  group_modify(~{
+    fit <- lm(sg_total ~ z_sg_ott + z_sg_apr + z_sg_arg + z_sg_putt, data = .x)
+    tibble(term = names(coef(fit))[-1], beta = coef(fit)[-1], r2 = summary(fit)$r.squared)
+  }) %>%
+  ungroup() %>%
+  mutate(component = str_remove(term, "^z_sg_"))
+
+cat("R2 range across years (expected to be ~1):\n")
+print(range(beta_by_year$r2))
+```
+
+```{r component-importance-plot}
+component_labels <- c(ott = "Off-the-Tee", apr = "Approach", arg = "Around-the-Green", putt = "Putting")
+
+p_components <- ggplot(beta_by_year, aes(year, beta, color = component)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  scale_color_manual(values = c(
+    ott = COL_PRIMARY, apr = COL_SECONDARY, arg = COL_NEUTRAL, putt = COL_ACCENT
+  ), labels = component_labels) +
+  labs(
+    title    = "Standardized Contribution of Each SG Component to SG_total",
+    subtitle = "Larger beta = that part of the game explains more of the spread in total performance",
+    x = NULL, y = "Standardized beta", color = NULL
+  ) +
+  THEME_BASE
+
+p_components
+```
+
+```{r component-findings}
+ott_2004 <- beta_by_year %>% filter(year == min(year), component == "ott") %>% pull(beta)
+ott_2025 <- beta_by_year %>% filter(year == max(year), component == "ott") %>% pull(beta)
+apr_2004 <- beta_by_year %>% filter(year == min(year), component == "apr") %>% pull(beta)
+apr_2025 <- beta_by_year %>% filter(year == max(year), component == "apr") %>% pull(beta)
+top_2025 <- beta_by_year %>% filter(year == max(year)) %>% slice_max(beta, n = 1) %>% pull(component)
+```
+
+**Finding:** R² is indeed ~1 in every year (as expected — this confirms the
+components decompose the total cleanly, it's not a meaningful model-fit
+result). Approach play (`apr`) has the largest standardized beta in both
+2004 (`r round(apr_2004, 2)`) and 2025 (`r round(apr_2025, 2)`) — it's
+still the single biggest driver of who separates from the pack on
+`sg_total`, contrary to what a pure "distance premium" narrative alone
+might suggest. But off-the-tee's beta rose from
+`r round(ott_2004, 2)` to `r round(ott_2025, 2)`, the largest increase of
+any component, narrowing the gap with approach considerably. The game
+hasn't become "all about the driver," but the driver's relative importance
+has clearly grown.
+
+---
+
+# 6. Distance Quintile SG_total Trajectories
+
+Using the field-relative distance quintiles already engineered in
+`00_data_engineering.Rmd` (`dist_quintile`, 1 = shortest, 5 = longest) — a
+grouped, less noisy view of the same relationship as sections 3/7.
+
+```{r quintile-trajectories}
+quintile_traj <- df_main %>%
+  group_by(year, dist_quintile) %>%
+  summarise(mean_sg_total = mean(sg_total, na.rm = TRUE), .groups = "drop")
+
+p_quintiles <- ggplot(quintile_traj, aes(year, mean_sg_total, color = factor(dist_quintile))) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = COL_QUINTILES, name = "Distance\nQuintile") +
+  labs(
+    title    = "Mean SG_total by Distance Quintile",
+    subtitle = "Quintile 1 = shortest hitters that season, 5 = longest",
+    x = NULL, y = "Mean SG_total"
+  ) +
+  THEME_BASE
+
+p_quintiles
+```
+
+```{r quintile-gap}
+gap_by_year <- quintile_traj %>%
+  filter(dist_quintile %in% c(1, 5)) %>%
+  pivot_wider(names_from = dist_quintile, values_from = mean_sg_total, names_prefix = "q") %>%
+  mutate(gap = q5 - q1)
+
+any_reversed <- sum(gap_by_year$gap < 0)
+gap_early <- gap_by_year %>% filter(year <= 2013) %>% summarise(m = mean(gap)) %>% pull(m)
+gap_late  <- gap_by_year %>% filter(year >= 2014) %>% summarise(m = mean(gap)) %>% pull(m)
+```
+
+**Finding:** the middle quintiles (2-4) aren't always perfectly ordered in
+a given year, but the top quintile (Q5, longest) beats the bottom quintile
+(Q1, shortest) in **every single year** of the dataset
+(`r any_reversed` reversals out of `r n_distinct(gap_by_year$year)` years).
+The gap has clearly widened: averaging
+`r round(gap_early, 2)` SG in 2004-2013 vs.
+`r round(gap_late, 2)` in 2014-2025 — a clean, independent confirmation
+that the longest hitters' advantage over the shortest has grown, matching
+the pooled model result in the next section.
+
+---
+
+# 7. Interaction Model: The Rigorous Test
+
+Sections 3-6 all point the same direction but are either noisy (3, 4) or
+descriptive rather than inferential (6). This model pools every
+player-season, controls for player-level heterogeneity with a random
+intercept and for age, and tests the distance-premium trend directly via a
+`dist_vs_field:year` interaction. `dist_vs_field` is rescaled to
+`dist_vs_field_10` (per 10 yards) so coefficients are directly
+interpretable as "SG per 10 yards above the field," and `year` is centered
+at its median so the main `dist_vs_field_10` effect describes the premium
+at a typical year in the sample, not a linear extrapolation back to year 0.
+
+```{r interaction-model}
+df_model <- df_main %>%
+  mutate(
+    dist_vs_field_10 = dist_vs_field / 10,
+    year_c = year - median(year)
+  )
+
+fit_interaction <- lmer(
+  sg_total ~ dist_vs_field_10 * year_c + age + (1 | player_name),
+  data = df_model
+)
+
+tidy(fit_interaction, effects = "fixed") %>% print()
+```
+
+```{r interaction-findings}
+coefs <- tidy(fit_interaction, effects = "fixed")
+premium_center <- coefs$estimate[coefs$term == "dist_vs_field_10"]
+premium_trend  <- coefs$estimate[coefs$term == "dist_vs_field_10:year_c"]
+premium_trend_t <- coefs$statistic[coefs$term == "dist_vs_field_10:year_c"]
+
+year_span <- (max(df_model$year) - min(df_model$year)) / 2
+premium_2004 <- premium_center - premium_trend * year_span
+premium_2025 <- premium_center + premium_trend * year_span
+```
+
+**Finding:** this is the test that actually resolves the question. The
+`dist_vs_field_10:year_c` interaction is
+`r round(premium_trend, 4)` (t = `r round(premium_trend_t, 2)`) — small per
+year, but real and statistically clear once pooled across ~4,000
+player-seasons. At the sample's center year, the premium is
+`r round(premium_center, 2)` SG per 10 yards above the field; projecting
+the trend to the ends of the window implies it's grown from roughly
+`r round(premium_2004, 2)` (2004) to roughly `r round(premium_2025, 2)`
+(2025) — **the distance premium has roughly
+`r round(premium_2025 / premium_2004, 1)`x'd** over the strokes-gained era.
+This is the reliable version of what sections 3 and 6 hinted at noisily.
+
+---
+
+# 8. Distance Premium Metric: Annual Slope Trajectory
+
+A year-by-year complement to section 7's single pooled estimate — expect
+this to be noisy for the same reasons as section 3 (same underlying
+data), with section 7 as the trustworthy summary.
+
+```{r annual-premium}
+premium_by_year <- df_main %>%
+  group_by(year) %>%
+  summarise(slope_per_10yd = coef(lm(sg_total ~ dist_vs_field))[["dist_vs_field"]] * 10, .groups = "drop")
+
+p_premium <- ggplot(premium_by_year, aes(year, slope_per_10yd)) +
+  geom_line(color = COL_ACCENT, linewidth = 1) +
+  geom_point(color = COL_ACCENT) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(
+    title    = "Distance Premium by Year",
+    subtitle = "SG_total per 10 yards above the field average, estimated separately each year",
+    x = NULL, y = "SG_total per 10 yards"
+  ) +
+  THEME_BASE
+
+p_premium
+```
+
+**Finding:** noisy year-to-year (ranging
+`r round(min(premium_by_year$slope_per_10yd), 2)` to
+`r round(max(premium_by_year$slope_per_10yd), 2)`), but with the same
+visible tilt as section 4's R² series — pre-2012 years cluster lower,
+2014 onward cluster higher — corroborating section 7's pooled estimate
+without needing to trust any single year's number.
+
+---
+
+# 9. Scatter Triptych: Three Eras
+
+```{r scatter-triptych}
+triptych_years <- c(2005, 2013, 2025)
+
+triptych_plots <- map(triptych_years, function(yr) {
+  df_main %>%
+    filter(year == yr) %>%
+    ggplot(aes(distance, sg_total)) +
+    geom_point(alpha = 0.5, color = COL_PRIMARY) +
+    geom_smooth(method = "lm", se = FALSE, color = COL_ACCENT, linewidth = 0.8) +
+    labs(title = as.character(yr), x = "Distance (yds)", y = "SG_total") +
+    THEME_BASE
+})
+
+wrap_plots(triptych_plots, nrow = 1) +
+  plot_annotation(title = "Distance vs. SG_total: Three Eras")
+```
+
+**Finding:** the fitted line's slope visibly steepens from 2005 to 2025 — a
+direct visual echo of the interaction model's finding in section 7.
+
+---
+
+# 10. Summary
+
+- **The distance premium has strengthened substantially** — the pooled
+  mixed-effects model (section 7) is the reliable evidence: the premium has
+  gone from roughly 0.1 to roughly 0.3 SG per 10 yards above the field, a
+  multi-fold increase, with a statistically clear interaction term behind
+  it.
+- **The simple year-by-year metrics (sections 3, 8) are too noisy to
+  answer this alone** — and part of that noise has a real cause, not just
+  small-sample jitter: years with a more compressed field of driving
+  distances show weaker year-specific relationships regardless of whether
+  measured by rank or magnitude (section 3.1).
+- **Approach play, not off-the-tee, is still the single largest
+  standardized driver of total performance** (section 4) — but
+  off-the-tee's relative importance has grown the most of the four
+  components, consistent with (not contradicting) the strengthening
+  premium.
+- **The longest-hitter quintile has out-performed the shortest-hitter
+  quintile every single year** (section 5), with the gap roughly doubling
+  from the 2004-2013 average to the 2014-2025 average — an independent,
+  low-noise confirmation of the same trend the interaction model finds.
+
+---
+
+# 11. Session Info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,396 @@
+---
+title: "04 — The Rising Floor"
+subtitle: "PGA Tour Distance & Speed Analytics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+# Overview
+
+**Question:** Has the minimum distance/speed required to compete on tour
+risen?
+
+**Data:** `df_main` (2004–2025). `ball_speed`/`chs` are only reliable from
+`SPEED_ERA_START` (2007) — see `00_data_engineering.Rmd` section 3.2 — so
+sections using those metrics filter accordingly; distance-only sections use
+the full 2004-2025 window.
+
+**A methodological issue found and resolved before building this
+notebook:** the docs call for a "time-to-obsolescence violin by
+entry_cohort" — years from a player's tour entry until the field's rising
+floor overtakes their entry-season distance. Tested directly: this is a
+genuine right-censored time-to-event problem (many players haven't been
+overtaken *yet*, they're not immune), and the censoring rate ranges from
+8% (pre-2000 entrants, plenty of follow-up time) to 74% (2020+ entrants,
+barely any follow-up time). A naive violin built on whoever happens to have
+an observed value would be badly biased toward whichever cohort's censored
+majority we silently dropped. Section 5 below shows the violin the docs
+ask for, but paired with a proper Kaplan-Meier estimate that handles the
+censoring correctly.
+
+---
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+# Core
+library(tidyverse)
+library(here)
+
+# Modeling
+library(survival)  # Kaplan-Meier for time-to-obsolescence (section 5)
+
+# Utilities
+library(broom)
+library(scales)
+
+source(here::here("config.R"))
+
+set.seed(2025)
+
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+---
+
+# 2. Load Data
+
+```{r load-data}
+df_main <- readRDS(here(PATH_PROCESSED, "df_main.rds"))
+df_speed <- df_main %>% filter(year >= SPEED_ERA_START)
+
+cat("Rows (full):        ", nrow(df_main), "\n")
+cat("Rows (speed era, ", SPEED_ERA_START, "+): ", nrow(df_speed), "\n", sep = "")
+
+key_cols <- c("entry_year", "sg_entry_year", "dist_entry", "entry_cohort", "distance", "sg_total")
+na_counts <- colSums(is.na(df_main[key_cols]))
+cat("\nNA counts in key columns:\n")
+if (all(na_counts == 0)) cat("(none - all zero)\n") else print(na_counts[na_counts > 0])
+```
+
+---
+
+# 3. Bottom Percentile Trends
+
+The most direct read on "has the floor risen": the 10th and 25th
+percentile of distance (all 22 years) and of ball speed/CHS (speed era
+only) — extending Project 1's fan-chart technique to the bottom of the
+distribution specifically, across all three power metrics rather than
+distance alone.
+
+```{r bottom-percentiles}
+bottom_all <- bind_rows(
+  df_main  %>% group_by(year) %>% summarise(p10 = quantile(distance, .10),   p25 = quantile(distance, .25),   .groups = "drop") %>% mutate(metric = "distance"),
+  df_speed %>% group_by(year) %>% summarise(p10 = quantile(ball_speed, .10), p25 = quantile(ball_speed, .25), .groups = "drop") %>% mutate(metric = "ball_speed"),
+  df_speed %>% group_by(year) %>% summarise(p10 = quantile(chs, .10),        p25 = quantile(chs, .25),        .groups = "drop") %>% mutate(metric = "chs")
+) %>%
+  pivot_longer(c(p10, p25), names_to = "pctile", values_to = "value")
+
+metric_labels <- c(distance = "Distance (yds)", ball_speed = "Ball Speed (mph)", chs = "Clubhead Speed (mph)")
+
+p_bottom <- ggplot(bottom_all, aes(year, value, color = pctile)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  facet_wrap(~metric, scales = "free_y", labeller = as_labeller(metric_labels)) +
+  scale_color_manual(values = c(p10 = COL_ACCENT, p25 = COL_SECONDARY),
+                      labels = c(p10 = "10th percentile", p25 = "25th percentile")) +
+  labs(
+    title    = "Bottom of the Field: 10th/25th Percentile Trends",
+    x = NULL, y = NULL, color = NULL
+  ) +
+  THEME_BASE
+
+p_bottom
+```
+
+```{r bottom-findings}
+bottom_growth <- bottom_all %>%
+  filter((metric == "distance" & year %in% c(2004, 2025)) |
+         (metric != "distance" & year %in% c(SPEED_ERA_START, 2025))) %>%
+  pivot_wider(names_from = year, values_from = value) %>%
+  rename(start = 3, end = 4) %>%
+  mutate(pct_change = 100 * (end - start) / start)
+```
+
+**Finding:** the floor has risen across all three metrics, at both the
+10th and 25th percentile — none of the six start/end comparisons show a
+decline (see the table above). Distance's 10th percentile grew
+`r round(bottom_growth$pct_change[bottom_growth$metric=="distance" & bottom_growth$pctile=="p10"], 1)`%
+from 2004-2025, comparable in direction to the overall-field increases
+found in Project 1 — the bottom of the field isn't being left behind by
+the top, both are moving up together.
+
+---
+
+# 4. Competitive Threshold Curves
+
+What distance does a merely-median (or below-average) competitor have each
+year? For each year, we find the player sitting at the SG_total median and
+at the SG_total 25th percentile, and read off *that specific player's*
+distance. Worth flagging upfront: extracting a single player's value at an
+exact rank is a genuinely noisy way to measure this — unlike a group
+average, one long-hitting-but-otherwise-mediocre player landing exactly at
+the 25th percentile that year can swing the reading by many yards. Treat
+this section's curves as illustrative, not as precise as the group-based
+metrics elsewhere in this notebook.
+
+```{r threshold-curves}
+threshold_by_year <- df_main %>%
+  group_by(year) %>%
+  arrange(sg_total, .by_group = TRUE) %>%
+  summarise(
+    n = n(),
+    dist_at_median_sg = distance[ceiling(0.50 * n())],
+    dist_at_p25_sg    = distance[ceiling(0.25 * n())],
+    .groups = "drop"
+  )
+
+p_threshold <- ggplot(threshold_by_year, aes(year)) +
+  geom_line(aes(y = dist_at_median_sg, color = "Median SG_total"), linewidth = 1) +
+  geom_line(aes(y = dist_at_p25_sg, color = "25th pctile SG_total"), linewidth = 1) +
+  scale_color_manual(values = c("Median SG_total" = COL_PRIMARY, "25th pctile SG_total" = COL_ACCENT), name = NULL) +
+  labs(
+    title    = "Competitive Threshold: Distance of a Median / Below-Average Performer",
+    subtitle = "Distance of the specific player sitting at each SG_total rank that year",
+    x = NULL, y = "Distance (yds)"
+  ) +
+  THEME_BASE
+
+p_threshold
+```
+
+```{r threshold-findings}
+thresh_2004 <- threshold_by_year %>% filter(year == min(year))
+thresh_2025 <- threshold_by_year %>% filter(year == max(year))
+gap <- threshold_by_year$dist_at_p25_sg - threshold_by_year$dist_at_median_sg
+reversals <- sum(gap > 0)
+```
+
+**Finding:** both curves trend upward over the full window — the median-SG
+player's distance went from `r round(thresh_2004$dist_at_median_sg, 1)`
+(2004) to `r round(thresh_2025$dist_at_median_sg, 1)` (2025) yards. But
+year to year this metric is genuinely unstable, not just mildly noisy: the
+25th-percentile-SG player is actually *longer* than the median-SG player in
+`r reversals` of `r nrow(threshold_by_year)` years, by as much as
+`r round(max(gap), 1)` yards in either direction
+(range `r round(min(gap), 1)` to `r round(max(gap), 1)`). That's the
+single-player-extraction problem flagged above showing up in practice, not
+a real signal that below-average performers out-hit average ones — a
+rolling multi-year average would smooth this out, but isn't done here
+since the long-run trend (both curves rising) is the point of this
+section, not year-to-year precision.
+
+---
+
+# 5. Minimum Viable Analysis ("Extended Image 3")
+
+Even restricting to the *best* performers each year (top 25/50/100 by
+SG_total, speed era only), has the *minimum* power level within that elite
+group risen — not just the average?
+
+```{r tiered-stats}
+tier_stats <- function(data, tier_n) {
+  data %>%
+    group_by(year) %>%
+    arrange(desc(sg_total), .by_group = TRUE) %>%
+    slice_head(n = tier_n) %>%
+    summarise(
+      avg_dist = mean(distance), min_dist = min(distance),
+      avg_ball = mean(ball_speed), min_ball = min(ball_speed),
+      avg_chs  = mean(chs), min_chs = min(chs),
+      .groups = "drop"
+    ) %>%
+    mutate(tier = factor(tier_n, levels = c(25, 50, 100)))
+}
+
+tiers <- bind_rows(tier_stats(df_speed, 25), tier_stats(df_speed, 50), tier_stats(df_speed, 100))
+
+tiers_long <- tiers %>%
+  pivot_longer(c(avg_dist, min_dist, avg_ball, min_ball, avg_chs, min_chs), names_to = "stat", values_to = "value") %>%
+  mutate(
+    metric = case_when(str_detect(stat, "dist") ~ "distance", str_detect(stat, "ball") ~ "ball_speed", TRUE ~ "chs"),
+    type   = if_else(str_detect(stat, "avg"), "Average", "Minimum")
+  )
+
+p_tiers <- ggplot(tiers_long, aes(year, value, color = tier, linetype = type)) +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~metric, scales = "free_y", labeller = as_labeller(metric_labels)) +
+  labs(
+    title    = "Minimum Viable Power Level Among Top Performers",
+    subtitle = "Solid = tier average, dashed = tier minimum, colored by tier size (top N by SG_total)",
+    x = NULL, y = NULL, color = "Tier (Top N)", linetype = NULL
+  ) +
+  THEME_BASE
+
+p_tiers
+```
+
+```{r tiers-findings}
+min_dist_25 <- tiers %>% filter(tier == 25)
+min_dist_growth <- 100 * (min_dist_25$min_dist[min_dist_25$year == max(min_dist_25$year)] -
+                            min_dist_25$min_dist[min_dist_25$year == min(min_dist_25$year)]) /
+                            min_dist_25$min_dist[min_dist_25$year == min(min_dist_25$year)]
+```
+
+**Finding:** the *minimum* distance among the top-25 SG performers grew
+`r round(min_dist_growth, 1)`% from `r min(min_dist_25$year)` to
+`r max(min_dist_25$year)` — even the least powerful player inside the
+elite tier has needed to keep pace. All three tier sizes (25/50/100) move
+together across all three metrics, with the minimum lines tracking the
+average lines reasonably closely rather than lagging far behind — being
+"just adequate" among elite performers has gotten more demanding at
+roughly the same rate as being average has.
+
+---
+
+# 6. Time-to-Obsolescence
+
+For each player: years from their strokes-gained-era entry
+(`sg_entry_year`) until the field's 25th-percentile distance first exceeds
+their (fixed) entry-season distance (`dist_entry`). As flagged in the
+Overview, many players haven't been overtaken within the observed data —
+they're censored, not immune — so we compute an explicit `censored` flag
+alongside the time.
+
+```{r compute-obsolescence}
+field_p25 <- df_main %>% group_by(year) %>% summarise(p25 = quantile(distance, 0.25), .groups = "drop")
+DATA_END_YEAR <- max(df_main$year)
+
+players <- df_main %>% distinct(player_name, sg_entry_year, dist_entry, entry_cohort)
+
+compute_obsolescence <- function(sg_entry_year, dist_entry) {
+  candidate_years <- field_p25 %>% filter(year >= sg_entry_year, p25 > dist_entry) %>% arrange(year)
+  if (nrow(candidate_years) == 0) {
+    return(tibble(time_to_obsolescence = DATA_END_YEAR - sg_entry_year, censored = TRUE))
+  }
+  y <- candidate_years$year[1]
+  tibble(time_to_obsolescence = y - sg_entry_year, censored = FALSE)
+}
+
+obsolescence <- players %>%
+  mutate(res = pmap(list(sg_entry_year, dist_entry), compute_obsolescence)) %>%
+  unnest(res) %>%
+  mutate(event = as.integer(!censored))
+
+censor_by_cohort <- obsolescence %>%
+  group_by(entry_cohort) %>%
+  summarise(n = n(), pct_censored = round(mean(censored) * 100, 1), .groups = "drop")
+
+censor_by_cohort %>% print()
+```
+
+**Finding:** censoring ranges from
+`r censor_by_cohort$pct_censored[censor_by_cohort$entry_cohort == "pre-2000"]`%
+(pre-2000 entrants, decades of follow-up) to
+`r censor_by_cohort$pct_censored[censor_by_cohort$entry_cohort == "2020+"]`%
+(2020+ entrants, barely any follow-up yet) — confirms the concern from the
+Overview. Any comparison across cohorts needs to account for this rather
+than silently dropping the censored majority in the newest cohort.
+
+## 6.1 Violin of observed times (as the docs ask for) — with censoring shown
+
+```{r violin-plot}
+max_time <- max(obsolescence$time_to_obsolescence)
+
+p_violin <- ggplot(obsolescence %>% filter(!censored), aes(entry_cohort, time_to_obsolescence, fill = entry_cohort)) +
+  geom_violin(alpha = 0.6) +
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  geom_text(
+    data = censor_by_cohort, inherit.aes = FALSE,
+    aes(x = entry_cohort, y = max_time + 2, label = paste0(pct_censored, "% censored")),
+    size = 3
+  ) +
+  labs(
+    title    = "Time-to-Obsolescence by Entry Cohort (Observed Cases Only)",
+    subtitle = "Violin includes only players actually observed to be overtaken - censoring % shown per cohort",
+    x = NULL, y = "Years from entry to obsolescence"
+  ) +
+  THEME_BASE +
+  theme(legend.position = "none")
+
+p_violin
+```
+
+## 6.2 Kaplan-Meier: the censoring-aware summary
+
+```{r km-fit}
+obsolescence_km <- obsolescence %>% filter(entry_cohort != "2020+")
+
+fit_km <- survfit(Surv(time_to_obsolescence, event) ~ entry_cohort, data = obsolescence_km)
+print(fit_km)
+```
+
+```{r km-plot}
+km_tidy <- tidy(fit_km) %>% mutate(entry_cohort = str_remove(strata, "entry_cohort="))
+
+p_km <- ggplot(km_tidy, aes(time, estimate, color = entry_cohort)) +
+  geom_step(linewidth = 1) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50") +
+  labs(
+    title    = "Kaplan-Meier: Time to Obsolescence by Entry Cohort",
+    subtitle = "Where a curve crosses the dashed line = that cohort's median time to obsolescence. 2020+ excluded (74% censored, median inestimable).",
+    x = "Years since tour entry", y = "Probability not yet obsolete", color = NULL
+  ) +
+  THEME_BASE
+
+p_km
+```
+
+```{r km-findings}
+km_medians <- summary(fit_km)$table[, "median"]
+```
+
+**Finding:** 2020+ is excluded from this comparison — at
+`r censor_by_cohort$pct_censored[censor_by_cohort$entry_cohort == "2020+"]`%
+censored, the Kaplan-Meier curve never reaches the 50% mark, so its median
+isn't estimable, not just imprecise. Among the three cohorts with adequate
+follow-up, the median time-to-obsolescence is **non-monotonic**: pre-2000
+entrants took `r km_medians[1]` years, 2000s entrants took the *longest* at
+`r km_medians[2]` years, and 2010s entrants took the *shortest* at only
+`r km_medians[3]` years. This tracks the era each cohort entered in rather
+than anything about the players themselves: 2000s entrants likely rode the
+post-Pro V1/COR-MOI distance boost (Project 1) for longer before the field
+caught up, while 2010s entrants ran into the field's accelerating,
+faster-rising floor (Projects 1-2's "Power Era") sooner.
+
+---
+
+# 7. Summary
+
+- **The bottom of the field has risen alongside the top**, not been left
+  behind — 10th and 25th percentile distance, ball speed, and CHS all
+  increased over the observed window, comparable in direction to the
+  overall-field trends from Project 1.
+- **Even the minimum viable power level among elite performers has risen**
+  — the least-powerful player inside the top-25 SG performers each year
+  needed meaningfully more distance by 2025 than in 2007, tracking the top
+  performers' average fairly closely rather than lagging behind.
+- **Time-to-obsolescence is a genuine censored time-to-event question**,
+  and naively violin-plotting it would have badly misrepresented recent
+  entrants (74% of the 2020+ cohort simply hasn't had time to be overtaken
+  yet). The Kaplan-Meier estimate shows a non-monotonic pattern across
+  cohorts with adequate follow-up — reflecting the pace of the field's
+  rise *during each cohort's career*, not a property of the players
+  themselves: 2000s entrants stayed competitive on entry-distance alone
+  longest (14 years), 2010s entrants the shortest (8 years).
+
+---
+
+# 8. Session Info
+
+```{r session-info}
+sessionInfo()
+```

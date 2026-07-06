@@ -307,6 +307,8 @@ library(lqmm)        # Quantile mixed-effects models
 library(segmented)   # Segmented regression with known breakpoints
 library(strucchange) # Bai-Perron structural break detection
 library(changepoint) # PELT changepoint detection
+library(moments)     # Skewness, kurtosis
+library(transport)   # 1D Wasserstein distance
 
 # Visualization
 library(ggplot2)

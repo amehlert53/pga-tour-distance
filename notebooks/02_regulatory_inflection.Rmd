@@ -1,0 +1,521 @@
+---
+title: "02 — Regulatory Inflection Points"
+subtitle: "PGA Tour Distance & Speed Analytics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+# Overview
+
+**Question:** Did equipment and rule changes produce statistically
+detectable changes in distance and accuracy trends?
+
+**Data:** `df_trends` aggregated to a season-mean time series (one row per
+year), not the player-level panel used in Project 1.
+
+**A design note before starting:** `config.R`'s `regulatory_events` lists 7
+events, but 2003 (COR Limits) and 2004 (Club Size/MOI Limits) are one year
+apart — annual data can't separately identify two breakpoints that close
+together (confirmed below). We merge them into one combined event,
+**"2003-04 COR/MOI Limits,"** rather than just noting the problem and
+moving on. The resulting 6 events are also labeled **"Equipment advance"**
+(1992 Oversized Drivers, 1996 Titanium Drivers, 2000 Pro V1) or
+**"Regulatory restriction"** (2003-04 COR/MOI Limits, 2010 Groove Rule, 2022
+Driver Length Limit) — a distinction that organizes the summary around this
+project's actual thesis: did the restrictive rules slow anything down, or
+did the enabling technology do the real work?
+
+We also don't assume effects are instant. A rule change might take 1-3
+years to show up as players adopt new equipment — so wherever a breakpoint
+or intervention date is estimated, we report the *lag* between the nominal
+regulatory year and the year the data actually shows a shift.
+
+---
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+# Core
+library(tidyverse)
+library(here)
+
+# Modeling
+library(segmented)   # segmented regression, known + selected breakpoints (section 3)
+library(changepoint) # PELT changepoint detection (section 4)
+library(strucchange) # Bai-Perron breakpoints, CUSUM (section 4)
+
+# Utilities
+library(broom)
+library(scales)
+
+source(here::here("config.R"))
+
+# segmented/changepoint/strucchange pull in MASS as a dependency, which masks
+# dplyr::select() - force dplyr's version to win for the rest of this notebook.
+select <- dplyr::select
+
+set.seed(2025)
+
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+---
+
+# 2. Load and Aggregate Data
+
+```{r load-data}
+df_trends <- readRDS(here(PATH_PROCESSED, "df_trends.rds"))
+
+season_means <- df_trends %>%
+  group_by(year) %>%
+  summarise(
+    n             = n(),
+    mean_distance = mean(distance, na.rm = TRUE),
+    mean_accuracy = mean(accuracy, na.rm = TRUE),
+    .groups       = "drop"
+  ) %>%
+  arrange(year)
+
+DATA_END_YEAR <- max(season_means$year)
+
+cat("Years:      ", nrow(season_means), "\n")
+cat("Year range: ", min(season_means$year), "-", DATA_END_YEAR, "\n")
+```
+
+## 2.1 Build the working event table
+
+Merge 2003 COR Limits + 2004 Club Size/MOI Limits into one event (see
+Overview), and label each event's category.
+
+```{r build-events}
+events <- regulatory_events %>%
+  mutate(
+    year  = if_else(year == 2004, 2003, year),
+    label = if_else(year == 2003, "COR/MOI Limits", label)
+  ) %>%
+  distinct(year, label) %>%
+  mutate(
+    category = if_else(year %in% c(1992, 1996, 2000), "Equipment advance", "Regulatory restriction")
+  ) %>%
+  arrange(year)
+
+events %>% print()
+```
+
+---
+
+# 3. Annotated Baseline Trend
+
+The visual starting point before any modeling — season-mean distance with
+each event marked, so the reader can eyeball candidate inflection points
+themselves before we quantify anything.
+
+```{r baseline-trend}
+p_baseline <- ggplot(season_means, aes(year, mean_distance)) +
+  geom_vline(data = events, aes(xintercept = year, color = category),
+             linetype = "dashed", linewidth = 0.6) +
+  geom_line(color = COL_PRIMARY, linewidth = 1) +
+  geom_point(color = COL_PRIMARY, size = 1.3) +
+  scale_color_manual(values = c(
+    "Equipment advance"      = COL_SECONDARY,
+    "Regulatory restriction" = COL_ACCENT
+  )) +
+  labs(
+    title    = "Season-Mean Driving Distance with Regulatory Events",
+    subtitle = "Dashed lines mark regulatory events (table below)",
+    x = NULL, y = "Mean Driving Distance (yards)", color = NULL
+  ) +
+  THEME_BASE
+
+p_baseline
+
+events %>% select(year, label, category) %>% print()
+```
+
+---
+
+# 4. Segmented Regression With Known Breakpoints
+
+We first tried supplying all 6 event years as candidate breakpoints to
+`segmented::segmented()` simultaneously — the honest result was that the
+model doesn't converge cleanly and several breakpoints come back with
+enormous standard errors (20+ years), meaning the ~39-year series simply
+can't support 6 independent breakpoints at once. Rather than report an
+unreliable 6-breakpoint model, we use `segmented::selgmented()`, which lets
+BIC pick how many breakpoints the data actually supports, then compare
+those data-supported breakpoints to the nominal event years.
+
+```{r segmented-naive-attempt}
+fit_lm <- lm(mean_distance ~ year, data = season_means)
+
+fit_seg_naive <- segmented(fit_lm, seg.Z = ~year, psi = events$year)
+naive_se <- fit_seg_naive$psi[, "St.Err"]
+
+cat("Standard errors on the 6 simultaneous breakpoints (years):\n")
+print(round(naive_se, 1))
+cat("\nMax SE:", round(max(naive_se), 1), "years -",
+    "this large means at least one breakpoint is not reliably identified.\n")
+```
+
+```{r segmented-selected}
+fit_seg <- selgmented(fit_lm, seg.Z = ~year, Kmax = 6, type = "bic", msg = FALSE)
+
+cat("BIC-selected number of breakpoints:", nrow(fit_seg$psi), "\n\n")
+fit_seg$psi %>% print()
+```
+
+**Finding:** forcing 6 simultaneous breakpoints produces standard errors up
+to `r round(max(naive_se), 1)` years — several breakpoints are essentially
+unidentified with only ~39 annual observations. Letting BIC choose instead
+selects `r nrow(fit_seg$psi)` breakpoints, all estimated tightly (SE well
+under a year to ~1 year): around
+`r paste(round(fit_seg$psi[, "Est."], 0), collapse = ", ")`. Comparing to
+the event table: the first is ambiguous between the two early
+equipment-advance events (1992/1996); the second lands close to (but
+`r round(fit_seg$psi[2, "Est."], 0) - 2003` years after) the 2003-04
+COR/MOI Limits event — a real example of the lag we were watching for; the
+third (~`r round(fit_seg$psi[3, "Est."], 0)`) doesn't correspond to any
+event in our list at all, and is worth flagging as an unexplained
+inflection rather than force-fitting it to the nearest regulation.
+
+```{r segmented-plot}
+season_means_fitted <- season_means %>%
+  mutate(fitted = predict(fit_seg))
+
+p_segmented <- ggplot(season_means_fitted, aes(year, mean_distance)) +
+  geom_vline(data = events, aes(xintercept = year, color = category),
+             linetype = "dashed", linewidth = 0.5, alpha = 0.6) +
+  geom_point(color = "grey50", size = 1) +
+  geom_line(aes(y = fitted), color = COL_PRIMARY, linewidth = 1.1) +
+  scale_color_manual(values = c(
+    "Equipment advance"      = COL_SECONDARY,
+    "Regulatory restriction" = COL_ACCENT
+  )) +
+  labs(
+    title    = "Segmented Regression: BIC-Selected Breakpoints",
+    subtitle = "Solid line: piecewise-linear fit. Dashed lines: nominal regulatory events.",
+    x = NULL, y = "Mean Driving Distance (yards)", color = NULL
+  ) +
+  THEME_BASE
+
+p_segmented
+```
+
+---
+
+# 5. Data-Driven Breakpoint Detection
+
+Two independent methods, neither given the event years, to check whether
+purely data-driven breaks land near the known regulations (a form of
+external validation for the segmented-regression result above).
+
+## 5.1 PELT on the differenced series
+
+PELT (`changepoint::cpt.mean`) run on the raw distance *level* series would
+flag breaks almost everywhere, since the level series has a strong secular
+trend baked in — the "mean" of a trending series is never stable for long.
+Running it on the *first-differenced* series (year-over-year gain) instead
+detects shifts in the *rate* of gain, which is what we actually care about.
+We use `minseglen = 3` to avoid the algorithm chasing single-year noise
+into an implausibly large number of breaks — without it, PELT returns 8
+breakpoints clustered around the already-known 2000-2003 transition, which
+is more a symptom of a choppy few years than 8 distinct regime changes.
+
+```{r pelt}
+diffs <- diff(season_means$mean_distance)
+
+cpt_fit <- cpt.mean(diffs, method = "PELT", penalty = "BIC", minseglen = 3)
+pelt_years <- season_means$year[cpts(cpt_fit) + 1]
+
+cat("PELT breakpoints (years):", paste(pelt_years, collapse = ", "), "\n")
+```
+
+## 5.2 Bai-Perron via strucchange
+
+`strucchange::breakpoints()` fits the regression directly (`mean_distance ~ year`)
+and finds the BIC-optimal number and location of slope breaks — the more
+natural tool for a trending regression, complementing PELT's differenced-series
+approach.
+
+```{r bai-perron}
+bp <- breakpoints(mean_distance ~ year, data = season_means, h = 0.15)
+bp_years <- season_means$year[bp$breakpoints]
+
+cat("Bai-Perron breakpoints (years):", paste(bp_years, collapse = ", "), "\n")
+```
+
+## 5.3 CUSUM structural stability test
+
+A visual complement: does the cumulative sum of recursive residuals stay
+within its confidence bounds, or cross them (signaling structural
+instability)?
+
+```{r cusum}
+cusum_fit <- efp(mean_distance ~ year, data = season_means, type = "OLS-CUSUM")
+plot(cusum_fit, main = "OLS-CUSUM Structural Stability Test")
+```
+
+**Finding:** PELT (`r paste(pelt_years, collapse = ", ")`) and Bai-Perron
+(`r paste(bp_years, collapse = ", ")`) roughly agree on an early-1990s
+break and a break in the early-to-mid 2000s, but diverge afterward — PELT
+finds nothing past 2003, while Bai-Perron detects a further break around
+2012, echoing the unexplained ~2014 inflection from the segmented model in
+section 4. Both methods' early breaks land close to the 1992 Oversized
+Driver rule and the 2000/2003 Pro V1/COR-MOI window — real agreement
+between a hypothesis-driven and a purely data-driven approach. The CUSUM
+path crossing its bounds confirms the series isn't structurally stable
+over the full window, consistent with both breakpoint methods.
+
+---
+
+# 6. Interrupted Time Series (ITS) Per Event
+
+For each event: fit `distance ~ year_centered * post` on a ±5-year window
+(3-year post-window for the 2022 event only — flagged explicitly, since
+2025 is the last year of data). Rather than assume the effect starts
+exactly at the nominal year, we test the `post` split at lags of 0, 1, and
+2 years and keep whichever lag fits best (highest R²) — this is where the
+"does the effect take a year or two to show up" question gets a direct,
+per-event answer rather than a single overall assumption.
+
+```{r its-function}
+fit_its_event <- function(event_year, label, category, pre_years = 5) {
+  post_years_available <- DATA_END_YEAR - event_year
+  post_years <- min(5, post_years_available)
+  truncated  <- post_years < 5
+
+  window <- season_means %>%
+    filter(year >= event_year - pre_years, year <= event_year + post_years)
+
+  lag_results <- map_dfr(0:2, function(lag) {
+    w <- window %>%
+      mutate(year_c = year - event_year, post = as.integer(year >= event_year + lag))
+    # Skip a lag if it leaves fewer than 2 points on either side of the split
+    if (n_distinct(w$post) < 2 || sum(w$post == 0) < 2 || sum(w$post == 1) < 2) return(tibble())
+    fit <- lm(mean_distance ~ year_c * post, data = w)
+    tibble(lag = lag, r2 = summary(fit)$r.squared, fit = list(fit))
+  })
+
+  best <- lag_results %>% slice_max(r2, n = 1, with_ties = FALSE)
+  fit  <- best$fit[[1]]
+  co   <- tidy(fit)
+
+  tibble(
+    year = event_year, label = label, category = category,
+    best_lag = best$lag, truncated_post = truncated, post_years_used = post_years,
+    level_change = co$estimate[co$term == "post"],
+    level_se     = co$std.error[co$term == "post"],
+    slope_change = co$estimate[co$term == "year_c:post"],
+    slope_se     = co$std.error[co$term == "year_c:post"]
+  )
+}
+
+its_results <- pmap_dfr(events, function(year, label, category) {
+  fit_its_event(year, label, category)
+})
+
+its_results %>% print(width = Inf)
+```
+
+```{r its-forest-plot}
+its_plot_data <- its_results %>%
+  mutate(
+    level_sig = abs(level_change / level_se) > qt(0.975, df = 8),
+    slope_sig = abs(slope_change / slope_se) > qt(0.975, df = 8),
+    label_ord = fct_reorder(paste0(label, " (", year, ")"), year)
+  )
+
+p_forest_level <- ggplot(its_plot_data, aes(level_change, label_ord, color = category)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbarh(aes(xmin = level_change - 1.96 * level_se, xmax = level_change + 1.96 * level_se), height = 0.2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Equipment advance" = COL_SECONDARY, "Regulatory restriction" = COL_ACCENT)) +
+  labs(title = "Level Change at Each Event (best-fitting lag)", x = "Yards", y = NULL, color = NULL) +
+  THEME_BASE
+
+p_forest_slope <- ggplot(its_plot_data, aes(slope_change, label_ord, color = category)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbarh(aes(xmin = slope_change - 1.96 * slope_se, xmax = slope_change + 1.96 * slope_se), height = 0.2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Equipment advance" = COL_SECONDARY, "Regulatory restriction" = COL_ACCENT)) +
+  labs(title = "Slope Change at Each Event (yds/year, best-fitting lag)", x = "Yards/year", y = NULL, color = NULL) +
+  THEME_BASE
+
+p_forest_level
+p_forest_slope
+```
+
+**Finding:** the clearest, most interpretable result is the 2003-04 COR/MOI
+event: a significant *level* jump
+(+`r round(its_results$level_change[its_results$year==2003], 1)` yds) followed
+by a significant *slope deceleration*
+(`r round(its_results$slope_change[its_results$year==2003], 2)` yds/yr) —
+distance jumped sharply, then growth cooled off, exactly the pattern you'd
+expect from a one-time equipment step-change rather than an ongoing
+acceleration. 1996 Titanium Drivers shows the opposite pattern — a
+significant slope *increase* with no immediate level jump — consistent with
+a technology that took a few years to diffuse through the field rather
+than an instant swap. The two most recent "restriction" events (2010 Groove
+Rule, 2022 Driver Length Limit) show no statistically significant slope
+change — no evidence either one meaningfully slowed distance gains (2022's
+estimate is also the least trustworthy of the six, given its
+`r its_results$post_years_used[its_results$year==2022]`-year, not 5-year,
+post-window).
+
+---
+
+# 7. Counterfactual Projection
+
+Project the pre-existing trend forward and compare to what actually
+happened — the gap is the "excess" distance gained beyond where the sport
+was already headed. The choice of baseline window matters a lot here:
+using data through 2002 (the documented "pre-2003" cutoff) already
+partially includes the early part of the 2000-2003 acceleration itself, so
+we also show a stricter pre-2000 ("before Pro V1") baseline as a robustness
+check.
+
+```{r counterfactual}
+fit_counterfactual <- function(cutoff_year) {
+  pre_data <- season_means %>% filter(year < cutoff_year)
+  fit <- lm(mean_distance ~ year, data = pre_data)
+  pred <- predict(fit, newdata = season_means, interval = "prediction", level = 0.95)
+  bind_cols(season_means, as_tibble(pred)) %>% mutate(baseline = paste0("Pre-", cutoff_year))
+}
+
+counterfactuals <- bind_rows(
+  fit_counterfactual(2000),
+  fit_counterfactual(2003)
+)
+
+p_counterfactual <- ggplot(counterfactuals, aes(year)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr, fill = baseline), alpha = 0.15) +
+  geom_line(aes(y = fit, color = baseline), linetype = "dashed", linewidth = 0.9) +
+  geom_line(aes(y = mean_distance), color = "black", linewidth = 1) +
+  scale_color_manual(values = c("Pre-2000" = COL_ACCENT, "Pre-2003" = COL_SECONDARY)) +
+  scale_fill_manual(values = c("Pre-2000" = COL_ACCENT, "Pre-2003" = COL_SECONDARY)) +
+  labs(
+    title    = "Actual Distance vs. Counterfactual Projections",
+    subtitle = "Black: actual. Dashed: pre-trend projected forward, with 95% prediction band.",
+    x = NULL, y = "Mean Driving Distance (yards)", color = NULL, fill = NULL
+  ) +
+  THEME_BASE
+
+p_counterfactual
+```
+
+```{r counterfactual-gap}
+gap_2000 <- counterfactuals %>% filter(baseline == "Pre-2000", year == DATA_END_YEAR) %>%
+  mutate(gap = mean_distance - fit) %>% pull(gap)
+gap_2003 <- counterfactuals %>% filter(baseline == "Pre-2003", year == DATA_END_YEAR) %>%
+  mutate(gap = mean_distance - fit) %>% pull(gap)
+
+slope_pre2000 <- coef(lm(mean_distance ~ year, data = season_means %>% filter(year < 2000)))[["year"]]
+slope_pre2003 <- coef(lm(mean_distance ~ year, data = season_means %>% filter(year < 2003)))[["year"]]
+```
+
+**Finding:** the two baselines tell different-looking stories, and the
+difference is itself the finding. The pre-2000 trend (slope
+`r round(slope_pre2000, 2)` yds/yr) projects a `r round(gap_2000, 1)`-yard
+gap by `r DATA_END_YEAR` — a real, sizable "excess" beyond where the sport
+was headed before Pro V1. The pre-2003 trend (slope
+`r round(slope_pre2003, 2)` yds/yr) — already steeper, because it
+partially includes the 2000-2002 ramp-up — projects a gap of only
+`r round(gap_2003, 1)` yards, since it's extrapolating a rate that already
+absorbed part of the acceleration. Neither number is "the" right answer;
+together they show the counterfactual gap is highly sensitive to exactly
+when you consider the "old normal" to have ended, which is worth keeping in
+mind before quoting a single "excess yards" figure anywhere else.
+
+---
+
+# 8. Accuracy — Lighter Parallel Check
+
+The question covers both distance and accuracy. Rather than repeat every
+analysis above, we run the same two structural-break tools (segmented
+regression, PELT) on `mean_accuracy` alone and compare.
+
+```{r accuracy-check}
+fit_lm_acc <- lm(mean_accuracy ~ year, data = season_means)
+fit_seg_acc <- selgmented(fit_lm_acc, seg.Z = ~year, Kmax = 4, type = "bic", msg = FALSE)
+
+cat("Accuracy breakpoints (BIC-selected):\n")
+print(fit_seg_acc$psi)
+
+diffs_acc <- diff(season_means$mean_accuracy)
+cpt_acc <- cpt.mean(diffs_acc, method = "PELT", penalty = "BIC", minseglen = 3)
+pelt_acc_years <- season_means$year[cpts(cpt_acc) + 1]
+cat("\nAccuracy PELT breakpoints:", if (length(pelt_acc_years) == 0) "none detected" else paste(pelt_acc_years, collapse = ", "), "\n")
+
+acc_1987 <- season_means %>% filter(year == min(year)) %>% pull(mean_accuracy)
+acc_peak_year <- fit_seg_acc$psi[1, "Est."]
+acc_2025 <- season_means %>% filter(year == max(year)) %>% pull(mean_accuracy)
+```
+
+**Finding:** accuracy shows a genuinely different pattern from distance,
+not just a mirror image of it. It's non-monotonic — rising from
+`r round(acc_1987, 1)`% in 1987 to a peak around
+`r round(acc_peak_year, 0)`, then declining substantially before leveling
+off (`r round(acc_2025, 1)`% by 2025) — and its own segmented breakpoints
+(~`r round(fit_seg_acc$psi[1,"Est."],0)`, ~`r round(fit_seg_acc$psi[2,"Est."],0)`)
+don't line up cleanly with distance's. Most tellingly, PELT finds
+**`r if (length(pelt_acc_years)==0) "no" else length(pelt_acc_years)`**
+rate-of-change breakpoints in accuracy's year-over-year series (vs. 3 for
+distance) — accuracy's rate of change has been comparatively gradual and
+smooth, with no sharp regime shifts, while distance's has clear, detectable
+jumps. That asymmetry itself supports the idea that the technology changes
+studied here acted much more directly on distance than on accuracy.
+
+---
+
+# 9. Summary
+
+- **Segmented regression and two independent data-driven methods broadly
+  agree**: there's a detectable break in the early 1990s and another
+  around the 2000-2003 Pro V1/COR-MOI window — but a further, unexplained
+  break around 2012-2014 shows up in two of the three methods that doesn't
+  correspond to any documented regulatory event.
+- **Effects are not uniformly instant.** The COR/MOI break in the
+  segmented model landed a couple of years after the nominal date, and the
+  1996 Titanium Drivers event shows up as a slope increase with no
+  immediate level jump — consistent with gradual equipment adoption rather
+  than an instant switch.
+- **The "restriction vs. advance" distinction matters.** The clearest,
+  most statistically confident event — COR/MOI Limits — actually shows a
+  significant level jump *followed by* a slope slowdown, i.e. exactly the
+  kind of one-time step-change-then-plateau you'd expect from a rule that
+  capped what had just been unlocked. The two most recent restrictions
+  (Groove Rule, Driver Length Limit) show no significant slope effect at
+  all — no evidence the rules meaningfully slowed the trend, echoing this
+  project's overarching narrative that regulatory interventions have had
+  limited effect.
+- **The counterfactual "excess yards" number is baseline-dependent** — a
+  pre-2000 baseline implies real excess distance gain; a pre-2003 baseline
+  implies almost none, because it already absorbs part of the run-up. Be
+  explicit about which baseline is being used whenever this number is
+  quoted elsewhere (e.g. in a blog post).
+- **Accuracy moves differently from distance**, not in lockstep — it rose
+  through the mid-1990s, then declined and flattened, with no sharp
+  data-driven breakpoints at all. Distance's gains look like a
+  technology/rule story; accuracy's decline looks more gradual and
+  diffuse.
+
+---
+
+# 10. Session Info
+
+```{r session-info}
+sessionInfo()
+```
