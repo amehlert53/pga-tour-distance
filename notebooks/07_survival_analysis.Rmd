@@ -1,0 +1,652 @@
+---
+title: "07 — Career Survival"
+subtitle: "PGA Tour Distance & Speed Analytics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+# Overview
+
+This notebook has two parts. **Part A** is the original survival-analysis
+scope from `docs/project_context.md`: what physical and competitive
+characteristics predict career longevity, and has being short off the tee
+become a *stronger* predictor of exit? **Part B**, added this session,
+digs into the mechanics of survival itself — what distinguishes players
+who persist to 38+ from those who drop off, whether there are distinct
+"types" of long-career adaptation, and whether the age of *top performers
+specifically* has shifted younger.
+
+**On handling players who drop off tour and later return:** this was
+already solved two sessions ago. `00b_survival_prep.Rmd` reconstructs each
+player's distinct *spells* (runs of consecutive seasons) with
+`gap_before`/`gap_after` between them, specifically so a mid-career gap
+followed by a comeback (e.g. Arjun Atwal's 2004-06 / 2011-12 / 2020
+pattern) is never mistaken for a career exit. The `event` indicator built
+below only ever attaches to a player's true final observed row — everyone
+else is `event = 0` regardless of how many gaps came before.
+
+---
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+# Core
+library(tidyverse)
+library(here)
+
+# Modeling
+library(survival)
+library(cluster)   # silhouette width (Part B, section 11)
+
+# Utilities
+library(broom)
+library(scales)
+
+source(here::here("config.R"))
+
+set.seed(2025)
+
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+`coord_radar()`, reused from `05_player_archetypes.Rmd` — ggplot2 has no
+native straight-edged polar-polygon coordinate system.
+
+```{r coord-radar-helper}
+coord_radar <- function(theta = "x", start = 0, direction = 1) {
+  theta <- match.arg(theta, c("x", "y"))
+  r <- if (theta == "x") "y" else "x"
+  ggproto("CordRadar", CoordPolar, theta = theta, r = r,
+          start = start, direction = sign(direction),
+          is_linear = function(coord) TRUE)
+}
+```
+
+---
+
+# 2. Load Data
+
+```{r load-data}
+df_survival <- readRDS(here(PATH_PROCESSED, "df_survival.rds"))
+df_main <- readRDS(here(PATH_PROCESSED, "df_main.rds")) %>% filter(player_name != "Patrick Sheehan")
+
+cat("df_survival: ", nrow(df_survival), "rows,", n_distinct(df_survival$player_name), "players\n")
+
+# sg_ott_avg/sg_putt_avg aren't in df_survival (it only carries sg_total,
+# not the components) - join career averages from df_main.
+sg_avgs <- df_main %>%
+  group_by(player_name) %>%
+  summarise(sg_ott_avg = mean(sg_ott), sg_putt_avg = mean(sg_putt), .groups = "drop")
+
+df_survival <- df_survival %>% left_join(sg_avgs, by = "player_name")
+```
+
+---
+
+# PART A: Core Survival Analysis
+
+# 3. Building the Event Indicator
+
+The censoring threshold was deliberately left undecided in
+`00b_survival_prep.Rmd` — it computed `final_gap_length` (years of absence
+since a player's last observed season) but not an `event` column. That
+choice gets made here, explicitly, as a sensitivity check rather than a
+silent assumption. Only a player's true final row (`year == max(year)`,
+always inside their final spell) can carry `event = 1`; every other row
+is `event = 0` by construction — this is the standard way to build
+start-stop survival data and is what correctly represents "still alive
+(on tour) at every earlier interval."
+
+```{r build-event}
+DATA_END_YEAR <- max(df_survival$year)
+
+df_survival <- df_survival %>%
+  group_by(player_name) %>%
+  mutate(is_last_row = row_number() == n()) %>%
+  ungroup() %>%
+  mutate(
+    event_2yr = if_else(is_last_row, as.integer(!is.na(final_gap_length) & final_gap_length >= 2), 0L),
+    event_3yr = if_else(is_last_row, as.integer(!is.na(final_gap_length) & final_gap_length >= 3), 0L),
+    event_4yr = if_else(is_last_row, as.integer(!is.na(final_gap_length) & final_gap_length >= 4), 0L)
+  )
+
+last_rows <- df_survival %>% filter(is_last_row)
+cat("Event rate by threshold (% of players classified as 'career ended'):\n")
+cat("  2-year gap:", round(mean(last_rows$event_2yr) * 100, 1), "%\n")
+cat("  3-year gap:", round(mean(last_rows$event_3yr) * 100, 1), "%\n")
+cat("  4-year gap:", round(mean(last_rows$event_4yr) * 100, 1), "%\n")
+```
+
+**Finding:** event rates range from 59.1% (4-year threshold) to 71.1%
+(2-year threshold) — a meaningfully large range, confirming the threshold
+choice matters. **3 years is used as the primary threshold** for sections
+4-5 and 7-8: 2 years risks the false-positive problem already found when
+`00b` was built (players who miss 2 seasons and return); 4 years discards
+real signal. The 2/4-year versions are used in section 6 as an explicit
+robustness check on the main results.
+
+```{r build-summary-table}
+df_survival <- df_survival %>% rename(event = event_3yr)
+one_row_per_player <- df_survival %>% filter(is_last_row)
+```
+
+---
+
+# 4. Kaplan-Meier by Distance Entry Quartile
+
+```{r km-fit}
+fit_km <- survfit(Surv(time_stop, event) ~ dist_entry_quartile, data = one_row_per_player)
+print(fit_km)
+
+fit_logrank <- survdiff(Surv(time_stop, event) ~ dist_entry_quartile, data = one_row_per_player)
+print(fit_logrank)
+```
+
+```{r km-plot}
+km_tidy <- tidy(fit_km) %>% mutate(quartile = str_remove(strata, "dist_entry_quartile="))
+
+p_km <- ggplot(km_tidy, aes(time, estimate, color = quartile)) +
+  geom_step(linewidth = 1) +
+  labs(
+    title    = "Career Survival by Distance Quartile at Entry",
+    subtitle = "Log-rank test: see finding below",
+    x = "Years since tour entry", y = "Probability still on tour", color = "Entry\nquartile"
+  ) +
+  THEME_BASE
+
+p_km
+```
+
+```{r km-findings}
+logrank_p <- 1 - pchisq(fit_logrank$chisq, length(fit_logrank$n) - 1)
+```
+
+**Finding:** the curves are visually close together and the log-rank test
+confirms it — p = `r round(logrank_p, 2)`, not significant. Median
+survival is 11-12 years across all four quartiles. Measured once, at the
+start of a career, entry distance alone is too coarse a signal to predict
+longevity — section 5's time-varying model is where the real signal
+shows up.
+
+---
+
+# 5. Cox PH (Time-Fixed)
+
+```{r cox-fixed}
+fit_cox_fixed <- coxph(
+  Surv(time_stop, event) ~ dist_entry_quartile + entry_cohort + sg_ott_avg + sg_putt_avg,
+  data = one_row_per_player
+)
+
+tidy(fit_cox_fixed, exponentiate = TRUE, conf.int = TRUE) %>% print()
+```
+
+**Finding:** `dist_entry_quartile` is borderline (HR just under 1, p≈0.06)
+— each additional entry-distance quartile is associated with slightly
+lower exit hazard, but not conclusively. `sg_ott_avg`/`sg_putt_avg` are
+both strongly protective (HR well below 1, p<0.001) — better career-average
+scoring predicts a much longer career, unsurprisingly. `entry_cohort`
+shows sharply *higher* hazard for more recent cohorts — but this needs a
+caveat, not a face-value reading: recent cohorts have mechanically less
+possible follow-up time in a dataset that ends in 2025 (the same
+"immaturity" issue found in Projects 4 and 6), which inflates their
+apparent hazard even though the Cox partial likelihood does correctly
+treat still-active recent players as censored, not dead.
+
+---
+
+# 6. Cox PH (Time-Varying)
+
+```{r cox-tv}
+fit_cox_tv <- coxph(Surv(time_start, time_stop, event) ~ dist_vs_field + sg_total, data = df_survival)
+
+tidy(fit_cox_tv, exponentiate = TRUE, conf.int = TRUE) %>% print()
+
+cat("\nProportional hazards check:\n")
+print(cox.zph(fit_cox_tv))
+```
+
+**Finding:** this is the cleanest answer to "does being short off the tee
+predict exit" — yes. `dist_vs_field` has HR 0.98 per yard (p<0.001): every
+yard above the field average that season reduces exit hazard, and
+`sg_total` is even more strongly protective (HR ≈0.32, p<0.001). The
+proportional-hazards assumption holds (global p = 0.21, no violation) —
+these estimates are trustworthy over the whole follow-up period, not just
+at one point in time.
+
+---
+
+# 7. Era-Stratified Cox + Censoring-Threshold Sensitivity
+
+## 7.1 Has the distance effect gotten stronger?
+
+```{r era-stratified}
+fit_early <- coxph(Surv(time_start, time_stop, event) ~ dist_vs_field + sg_total,
+                    data = df_survival %>% filter(entry_year >= 2004, entry_year <= 2012))
+fit_late <- coxph(Surv(time_start, time_stop, event) ~ dist_vs_field + sg_total,
+                   data = df_survival %>% filter(entry_year >= 2013, entry_year <= 2025))
+
+bind_rows(
+  tidy(fit_early, exponentiate = TRUE, conf.int = TRUE) %>% filter(term == "dist_vs_field") %>% mutate(era = "2004-2012 entrants"),
+  tidy(fit_late, exponentiate = TRUE, conf.int = TRUE) %>% filter(term == "dist_vs_field") %>% mutate(era = "2013-2025 entrants")
+) %>% select(era, estimate, p.value, conf.low, conf.high) %>% print()
+```
+
+**Finding:** the 2004-2012 entrant cohort shows a significant protective
+distance effect (p=0.011); the 2013-2025 cohort does not (p=0.22), and the
+confidence intervals overlap substantially. This does **not** support the
+question's premise that distance has become a *stronger* predictor of
+exit — if anything the point estimate moved slightly toward 1 (weaker).
+The most likely explanation is that the 2013-2025 cohort simply has less
+mature follow-up (fewer of them have had the chance to exit yet, so there
+are fewer events to detect an effect with) — not a genuine change in the
+underlying relationship. Reported as "no clear evidence of strengthening,"
+not a confident claim in either direction.
+
+## 7.2 Does the choice of censoring threshold change the conclusion?
+
+```{r threshold-sensitivity}
+fit_2yr <- coxph(Surv(time_start, time_stop, event_2yr) ~ dist_vs_field + sg_total, data = df_survival)
+fit_4yr <- coxph(Surv(time_start, time_stop, event_4yr) ~ dist_vs_field + sg_total, data = df_survival)
+
+bind_rows(
+  tidy(fit_2yr, exponentiate = TRUE) %>% mutate(threshold = "2-year"),
+  tidy(fit_cox_tv, exponentiate = TRUE) %>% mutate(threshold = "3-year (primary)"),
+  tidy(fit_4yr, exponentiate = TRUE) %>% mutate(threshold = "4-year")
+) %>% select(threshold, term, estimate, p.value) %>% print()
+```
+
+**Finding:** both `dist_vs_field` and `sg_total` stay significantly
+protective (p<0.001) across all three censoring thresholds — the exact
+hazard ratios shift a little, but the qualitative conclusion (both are
+real, protective predictors of career survival) is stable regardless of
+which threshold is used. The censoring-threshold choice affects precision,
+not the direction of the finding.
+
+---
+
+# 8. Forest Plot of Cox Hazard Ratios
+
+```{r forest-plot}
+forest_data <- bind_rows(
+  tidy(fit_cox_fixed, exponentiate = TRUE, conf.int = TRUE) %>% mutate(model = "Time-fixed"),
+  tidy(fit_cox_tv, exponentiate = TRUE, conf.int = TRUE) %>% mutate(model = "Time-varying")
+) %>%
+  filter(!str_detect(term, "entry_cohort"))
+
+p_forest <- ggplot(forest_data, aes(estimate, fct_reorder(term, estimate), color = model)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2, position = position_dodge(width = 0.4)) +
+  geom_point(size = 3, position = position_dodge(width = 0.4)) +
+  scale_x_log10() +
+  scale_color_manual(values = c("Time-fixed" = COL_SECONDARY, "Time-varying" = COL_PRIMARY)) +
+  labs(
+    title    = "Cox Hazard Ratios: What Predicts Career Exit",
+    subtitle = "HR < 1 = protective (lower hazard of exit). Log scale.",
+    x = "Hazard ratio", y = NULL, color = NULL
+  ) +
+  THEME_BASE
+
+p_forest
+```
+
+**Finding:** every covariate shown sits below HR=1 — every one of these
+factors (distance, SG performance) is protective, none increases exit
+hazard. Distance's effect (both entry-quartile and time-varying) is
+consistently the smallest-magnitude protective factor; strokes-gained
+performance measures are the strongest predictors of career survival.
+
+---
+
+# PART B: The Anatomy of Longevity
+
+# 9. Age of Top Performers Over Time
+
+Project 6 found the field's overall age composition has shifted younger.
+Here we ask a sharper question: has the age of the *best* performers
+specifically shifted younger, beyond what the field-wide shift alone would
+predict?
+
+```{r age-top-performers}
+top25 <- df_main %>%
+  group_by(year) %>%
+  mutate(sg_rank_pct = percent_rank(sg_total)) %>%
+  ungroup() %>%
+  filter(sg_rank_pct >= 0.75)
+
+age_comparison <- top25 %>%
+  group_by(year) %>%
+  summarise(mean_age_top25 = mean(age), .groups = "drop") %>%
+  left_join(df_main %>% group_by(year) %>% summarise(mean_age_field = mean(age), .groups = "drop"), by = "year") %>%
+  mutate(gap = mean_age_top25 - mean_age_field)
+
+p_age_top <- ggplot(age_comparison, aes(year)) +
+  geom_line(aes(y = mean_age_top25, color = "Top-25% SG_total"), linewidth = 1) +
+  geom_line(aes(y = mean_age_field, color = "Whole field"), linewidth = 1) +
+  scale_color_manual(values = c("Top-25% SG_total" = COL_PRIMARY, "Whole field" = COL_NEUTRAL)) +
+  labs(title = "Mean Age: Top Performers vs. Whole Field", x = NULL, y = "Mean age", color = NULL) +
+  THEME_BASE
+
+p_gap <- ggplot(age_comparison, aes(year, gap)) +
+  geom_col(fill = COL_ACCENT) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(title = "Age Gap: Top Performers Minus Field", x = NULL, y = "Years") +
+  THEME_BASE
+
+p_age_top
+p_gap
+```
+
+```{r age-top-findings}
+age_trend <- tidy(lm(mean_age_top25 ~ year, data = age_comparison)) %>% filter(term == "year")
+gap_2004 <- age_comparison %>% filter(year == min(year)) %>% pull(gap)
+gap_2025 <- age_comparison %>% filter(year == max(year)) %>% pull(gap)
+```
+
+**Finding:** the mean age of top-25% SG_total performers dropped
+significantly, `r round(age_trend$estimate, 3)` years/year
+(p `r if(age_trend$p.value < 0.001) "< 0.001" else round(age_trend$p.value,4)`).
+More tellingly, the *gap* to the field average widened from
+`r round(gap_2004, 1)` years (2004 — top performers were about the same
+age as the field) to `r round(gap_2025, 1)` years (2025 — top performers
+are now notably younger than the field). This is a distinct pressure on
+veteran players beyond their own individual decline (Part A, section 6):
+even a player who hasn't personally gotten worse is now competing against
+an increasingly youth-skewed set of the very best players.
+
+---
+
+# 10. Extended Adaptation Analysis
+
+For players who ever reached age 38+ (persistent players), how does their
+performance at 30-34 ("prime") compare to their performance at 38+, across
+every physical and scoring metric available — not just the 4 tested in
+Project 6?
+
+```{r persistent-players}
+persistent <- df_main %>%
+  group_by(player_name) %>%
+  summarise(max_age = max(age), .groups = "drop") %>%
+  filter(max_age >= 38) %>%
+  pull(player_name)
+
+cat("Persistent players (reached 38+):", length(persistent), "of", n_distinct(df_main$player_name), "\n")
+```
+
+```{r adaptation-compute}
+compute_change <- function(metric_col, speed_era_only = FALSE) {
+  d <- df_main %>%
+    filter(player_name %in% persistent, age >= 30, age <= 34 | age >= 38) %>%
+    mutate(band = if_else(age <= 34, "prime", "late"))
+  if (speed_era_only) d <- d %>% filter(year >= SPEED_ERA_START)
+
+  d %>%
+    group_by(player_name, band) %>%
+    summarise(m = mean(.data[[metric_col]], na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = band, values_from = m) %>%
+    filter(!is.na(prime), !is.na(late)) %>%
+    mutate(change = late - prime, metric = metric_col)
+}
+
+adaptation_all <- bind_rows(
+  compute_change("dist_vs_field"),
+  compute_change("acc_vs_field"),
+  compute_change("sg_ott"),
+  compute_change("sg_apr"),
+  compute_change("sg_arg"),
+  compute_change("sg_putt"),
+  compute_change("sg_total"),
+  compute_change("speed_vs_field", speed_era_only = TRUE),
+  compute_change("chs_vs_field", speed_era_only = TRUE)
+)
+
+adaptation_summary <- adaptation_all %>%
+  group_by(metric) %>%
+  summarise(n = n(), median_change = median(change), .groups = "drop")
+
+adaptation_summary %>% print()
+```
+
+```{r adaptation-plot}
+metric_order <- c("dist_vs_field", "speed_vs_field", "chs_vs_field", "sg_ott",
+                   "sg_apr", "sg_putt", "sg_total", "sg_arg", "acc_vs_field")
+metric_labels <- c(
+  dist_vs_field = "Distance vs. field", speed_vs_field = "Ball speed vs. field",
+  chs_vs_field = "CHS vs. field", sg_ott = "SG_OTT", sg_apr = "SG_APR",
+  sg_arg = "SG_ARG (around-green)", sg_putt = "SG_Putt", sg_total = "SG_Total",
+  acc_vs_field = "Accuracy vs. field"
+)
+
+p_adaptation <- adaptation_summary %>%
+  mutate(metric = factor(metric, levels = metric_order)) %>%
+  ggplot(aes(median_change, metric, fill = median_change > 0)) +
+  geom_col() +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_y_discrete(labels = metric_labels) +
+  scale_fill_manual(values = c("TRUE" = COL_PRIMARY, "FALSE" = COL_ACCENT), guide = "none") +
+  labs(
+    title    = "Median Change From Prime (30-34) to 38+, Persistent Players",
+    subtitle = "Blue = improved with age, red = declined",
+    x = "Median change", y = NULL
+  ) +
+  THEME_BASE
+
+p_adaptation
+```
+
+**Finding:** exactly the pattern hypothesized — power metrics decline
+(distance, ball speed, CHS all clearly negative), but **accuracy improves**
+(the only physical metric that goes up), and **SG_ARG (around-the-green)
+is essentially flat**, the least-declining of the scoring components.
+SG_Total still declines on net — the accuracy/short-game compensation
+helps, but doesn't fully offset the power loss.
+
+---
+
+# 11. Maintained vs. Declined Comparison
+
+Splitting persistent players by whether they kept `sg_total` positive
+(field-average or better) at 38+, or fell negative — does *how* they
+adapted differ, not just whether they were good?
+
+```{r maintained-vs-declined}
+late_sg <- df_main %>%
+  filter(player_name %in% persistent, age >= 38) %>%
+  group_by(player_name) %>%
+  summarise(late_sg_total = mean(sg_total), .groups = "drop") %>%
+  mutate(group = if_else(late_sg_total >= 0, "Maintained (SG+)", "Declined (SG-)"))
+
+cat("Maintained (SG+):", sum(late_sg$group == "Maintained (SG+)"),
+    " Declined (SG-):", sum(late_sg$group == "Declined (SG-)"), "\n")
+
+dist_change <- compute_change("dist_vs_field") %>% select(player_name, dist_change = change)
+acc_change <- compute_change("acc_vs_field") %>% select(player_name, acc_change = change)
+
+group_comparison <- dist_change %>%
+  inner_join(acc_change, by = "player_name") %>%
+  inner_join(late_sg %>% select(player_name, group), by = "player_name") %>%
+  pivot_longer(c(dist_change, acc_change), names_to = "metric", values_to = "change")
+
+comparison_summary <- group_comparison %>%
+  group_by(group, metric) %>%
+  summarise(median_change = median(change), .groups = "drop")
+
+comparison_summary %>% print()
+```
+
+```{r maintained-plot}
+p_maintained <- ggplot(comparison_summary, aes(group, median_change, fill = group)) +
+  geom_col() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  facet_wrap(~metric, scales = "free_y", labeller = as_labeller(c(
+    dist_change = "Distance vs. field, change", acc_change = "Accuracy vs. field, change"
+  ))) +
+  scale_fill_manual(values = c("Maintained (SG+)" = COL_PRIMARY, "Declined (SG-)" = COL_ACCENT)) +
+  labs(title = "Adaptation Pattern: Maintained vs. Declined Players", x = NULL, y = "Median change (prime to 38+)", fill = NULL) +
+  THEME_BASE
+
+p_maintained
+```
+
+**Finding:** players who maintain SG_Total-positive performance at 38+
+lose less distance **and** gain more accuracy than those who decline —
+both directions of the adaptation matter, it isn't just "the ones who keep
+their distance stay good" or purely "the ones who get more accurate stay
+good." Successful long-term survival combines slower power decline with a
+bigger accuracy gain.
+
+---
+
+# 12. Persistence Archetypes (Clustering)
+
+Do persistent players cluster into distinct "types" of adaptation, the way
+Project 5 found distinct player archetypes overall?
+
+```{r persistence-clustering-data}
+change_wide <- adaptation_all %>%
+  filter(metric %in% c("dist_vs_field", "acc_vs_field", "sg_ott", "sg_apr", "sg_arg", "sg_putt")) %>%
+  select(player_name, metric, change) %>%
+  pivot_wider(names_from = metric, values_from = change) %>%
+  filter(if_all(-player_name, ~!is.na(.x)))
+
+cat("Players with a full change vector:", nrow(change_wide), "\n")
+
+X <- change_wide %>% select(-player_name) %>% as.matrix() %>% scale()
+
+sil_scores <- map_dbl(2:5, function(k) {
+  km <- kmeans(X, centers = k, nstart = 25)
+  mean(silhouette(km$cluster, dist(X))[, 3])
+})
+cat("Silhouette scores k=2..5:\n"); print(setNames(round(sil_scores, 3), 2:5))
+```
+
+Silhouette technically favors k=2, but as in Project 5, we use **k=3** —
+a small step down in silhouette width for meaningfully more interpretable,
+distinct archetypes.
+
+```{r persistence-clustering-fit}
+set.seed(2025)
+km3 <- kmeans(X, centers = 3, nstart = 25)
+change_wide$cluster <- factor(km3$cluster)
+
+centers_unscaled <- sweep(sweep(km3$centers, 2, attr(X, "scaled:scale"), `*`), 2, attr(X, "scaled:center"), `+`) %>%
+  as_tibble() %>%
+  mutate(cluster = row_number(), size = km3$size) %>%
+  mutate(label = case_when(
+    dist_vs_field < -8 & acc_vs_field > 3 ~ "Traded power for precision",
+    dist_vs_field < 0 & acc_vs_field < 0  ~ "Across-the-board decliner",
+    TRUE                                   ~ "Mild all-around decliner"
+  ))
+
+centers_unscaled %>% print()
+```
+
+```{r persistence-radar}
+radar_data <- centers_unscaled %>%
+  select(label, dist_vs_field, acc_vs_field, sg_ott, sg_apr, sg_arg, sg_putt) %>%
+  pivot_longer(-label, names_to = "variable", values_to = "value") %>%
+  mutate(variable = factor(variable, levels = c("dist_vs_field", "acc_vs_field", "sg_ott", "sg_apr", "sg_arg", "sg_putt")))
+
+radar_closed <- radar_data %>%
+  group_by(label) %>%
+  group_modify(~bind_rows(.x, .x[1, ])) %>%
+  ungroup()
+
+p_radar <- ggplot(radar_closed, aes(variable, value, group = label, color = label)) +
+  geom_polygon(aes(fill = label), alpha = 0.1, linewidth = 1) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  coord_radar() +
+  labs(title = "Persistence Archetypes: Change Profile, Prime to 38+", color = NULL, fill = NULL) +
+  THEME_BASE
+
+p_radar
+```
+
+**Finding:** three distinct archetypes emerge among persistent players —
+`r paste(centers_unscaled$label, "(n=", centers_unscaled$size, ")", collapse = "; ")`.
+The "traded power for precision" group shows the clearest compensation
+pattern (biggest distance loss, biggest accuracy gain); the "across-the-board
+decliner" group shows no such compensation — everything declines together.
+
+---
+
+# 13. Late-Career Survivor Profile (38+ Ever vs. Never)
+
+The original docs' ask, using career-average stats (not last-observed-row
+snapshots, which would confound still-active younger players with
+genuinely retired older ones).
+
+```{r late-career-profile}
+player_career_profile <- df_survival %>%
+  group_by(player_name) %>%
+  summarise(career_dist_vs_field = mean(dist_vs_field), career_sg_total = mean(sg_total), .groups = "drop") %>%
+  left_join(df_main %>% group_by(player_name) %>% summarise(max_age = max(age), .groups = "drop"), by = "player_name") %>%
+  mutate(reached_38 = max_age >= 38)
+
+cmp <- player_career_profile %>%
+  group_by(reached_38) %>%
+  summarise(n = n(), mean_career_dist = mean(career_dist_vs_field), mean_career_sg = mean(career_sg_total), .groups = "drop")
+
+cmp %>% print()
+
+t_dist <- t.test(career_dist_vs_field ~ reached_38, data = player_career_profile)
+t_sg <- t.test(career_sg_total ~ reached_38, data = player_career_profile)
+cat("\ndistance t-test p =", format.pval(t_dist$p.value, digits = 3), "\n")
+cat("sg_total t-test p =", format.pval(t_sg$p.value, digits = 3), "\n")
+```
+
+**Finding:** players who ever reach 38+ have a **lower** career-average
+distance-vs-field than those who never do (p<0.001) but a **higher**
+career-average SG_Total (p<0.001). This ties Part A and Part B together:
+what predicts who survives on tour long-term isn't raw power — it's
+overall scoring ability. The whole project keeps circling back to this
+same nuance from a different angle each time.
+
+---
+
+# 14. Summary
+
+- **Part A:** entry-distance alone is too coarse to predict career length
+  (KM/log-rank not significant), but time-varying distance and SG_Total
+  are both real, statistically significant, protective predictors of
+  survival, robust across three different censoring-threshold definitions.
+  There is **no clear evidence** that distance's protective effect has
+  gotten stronger over time — the apparent difference between eras is more
+  likely a statistical-power artifact of the newer cohort's immature
+  follow-up than a real change.
+- **Part B:** the age of top performers specifically has dropped even
+  faster than the field overall, and the gap between them has widened —
+  a growing structural pressure on veterans. Among players who do persist
+  to 38+, the mechanism is adaptation, not preservation: power reliably
+  declines, but accuracy and around-the-green play partially compensate,
+  and the players who successfully maintain strong overall performance are
+  the ones who both decline less in power *and* gain more in accuracy —
+  not one or the other. Three distinct adaptation archetypes exist, from
+  clean power-for-precision trades to across-the-board decline with no
+  compensation at all.
+- **The throughline across all seven projects**: distance matters, and
+  its relationship to success has genuinely strengthened — but overall
+  game quality, not raw power alone, is what determines who actually stays
+  on tour long enough to matter.
+
+---
+
+# 15. Session Info
+
+```{r session-info}
+sessionInfo()
+```
