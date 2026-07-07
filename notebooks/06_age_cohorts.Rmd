@@ -1,0 +1,549 @@
+---
+title: "06 — Age and Cohorts"
+subtitle: "PGA Tour Distance & Speed Analytics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+# Overview
+
+**Original question:** When do players peak in distance? Are newer
+(birth) cohorts entering with more speed? Is the age of peak distance
+changing? This uses `birth_cohort` throughout, not `entry_cohort` — a
+generational question, not a career-stage one (see `00_data_engineering.Rmd`
+sections 3.4/4.1 for why the two are kept separate).
+
+**Expanded scope:** are specific age groups gaining or losing ground
+*relative to the field* over calendar time (not just in absolute terms)?
+Are older players being pushed off tour? Among players who reach 40+, do
+some maintain their level while others decline?
+
+**Four issues found by testing before writing any of the analysis below** —
+worth reading first, since they shape how several sections are built:
+
+1. **A data error, isolated to one player.** "Patrick Sheehan" has 6 rows
+   (2004-2012) all sharing `birth_year = 1992` (implying ages 12-20), but
+   also `turned_pro = 2023` — inconsistent with playing 2004-2012 at all.
+   Almost certainly two real people sharing a name, merged in the source
+   data. Confirmed not systemic elsewhere. Excluded from this notebook; an
+   age-plausibility check (< 18 or > 55) was also added to
+   `00_data_engineering.Rmd`'s existing range-check section so future work
+   inherits the flag.
+2. **`birth_cohort = "2000s+"` has only 3 players with 3+ seasons** — too
+   few to model, excluded from per-cohort fitting.
+3. **The docs' peak-age vertex formula (`-β_age/(2×β_age²)`) is
+   statistically unstable here** — tested at both the pooled and
+   per-cohort level, detailed in section 3. A nonparametric alternative
+   (age at personal-best distance) is used instead, with an explicit
+   caveat about incomplete career observation for newer cohorts.
+4. **The "do 40+ players maintain performance" question needs a
+   within-player design**, not a generic random-slopes comparison across
+   players (which turned out to be confounded by career length) — detailed
+   in section 8.
+
+---
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+# Core
+library(tidyverse)
+library(here)
+
+# Modeling
+library(lme4)
+library(broom.mixed)
+
+# Utilities
+library(broom)
+library(scales)
+
+source(here::here("config.R"))
+
+set.seed(2025)
+
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+---
+
+# 2. Load Data
+
+```{r load-data}
+df_main <- readRDS(here(PATH_PROCESSED, "df_main.rds")) %>%
+  filter(player_name != "Patrick Sheehan")
+
+cat("Rows (excl. Patrick Sheehan):", nrow(df_main), "\n")
+cat("Unique players:              ", n_distinct(df_main$player_name), "\n\n")
+
+cat("birth_cohort counts, players with n_seasons >= 3:\n")
+print(df_main %>% filter(n_seasons >= 3) %>% distinct(player_name, birth_cohort) %>% count(birth_cohort))
+```
+
+**Finding:** `2000s+` has only 3 players with 3+ seasons — excluded from
+every per-cohort model below (sections 3-4), but included in the
+age-group analyses (sections 7-8), which don't require per-cohort model
+fitting.
+
+---
+
+# 3. Age-Distance Curve
+
+`lmer(distance ~ age_c + age_c2 + (1 + age_c | player_name))`, restricted
+to `n_seasons >= 3` per the docs, age centered for interpretability and to
+reduce collinearity between the linear and quadratic terms.
+
+```{r age-distance-model}
+df_3plus <- df_main %>% filter(n_seasons >= 3)
+mean_age <- mean(df_3plus$age)
+
+df_3plus <- df_3plus %>% mutate(age_c = age - mean_age, age_c2 = age_c^2)
+
+fit_age <- lmer(
+  distance ~ age_c + age_c2 + (1 + age_c | player_name),
+  data = df_3plus,
+  control = lmerControl(optimizer = "bobyqa")
+)
+
+tidy(fit_age, effects = "fixed") %>% print()
+```
+
+```{r age-distance-findings}
+age_coefs <- tidy(fit_age, effects = "fixed")
+age_c2_t <- age_coefs$statistic[age_coefs$term == "age_c2"]
+```
+
+**Finding:** the quadratic term's t-statistic is only
+`r round(age_c2_t, 2)` — not statistically significant. The
+population-average age-distance relationship is close to a flat decline
+across the observed age range, not the clean rise-then-fall parabola the
+docs' peak-age formula assumes. Likely explanation: players enter this
+dataset already near or past their physical peak (PGA Tour rookies are
+mostly in their low-to-mid 20s, not teenagers), so we mostly observe the
+plateau/decline phase of a career, with too little of the "rise" phase to
+pin down a real vertex. Rather than force a parabola, the visual below
+uses a flexible smoother that can show whatever shape is actually present.
+
+```{r age-distance-plot}
+p_age_distance <- df_3plus %>%
+  filter(birth_cohort != "2000s+") %>%
+  ggplot(aes(age, distance)) +
+  geom_point(alpha = 0.15, size = 0.7, color = COL_NEUTRAL) +
+  geom_smooth(method = "loess", color = COL_PRIMARY, fill = COL_PRIMARY) +
+  facet_wrap(~birth_cohort) +
+  labs(
+    title    = "Age-Distance Relationship by Birth Cohort",
+    subtitle = "Loess smooth with 95% CI ribbon (not a forced quadratic - see finding above)",
+    x = "Age", y = "Distance (yds)"
+  ) +
+  THEME_BASE
+
+p_age_distance
+```
+
+---
+
+# 4. Peak Age Estimation
+
+Reported honestly: the vertex formula is not reliable here, tested two
+ways.
+
+```{r peak-age-vertex}
+pooled_peak <- -age_coefs$estimate[age_coefs$term == "age_c"] / (2 * age_coefs$estimate[age_coefs$term == "age_c2"])
+cat("Pooled vertex estimate (age_c units, centered at mean age", round(mean_age, 1), "):", round(pooled_peak, 1), "\n")
+
+cohorts_present <- setdiff(levels(df_3plus$birth_cohort), "2000s+")
+
+vertex_by_cohort <- map_dfr(cohorts_present, function(bc) {
+  d <- df_3plus %>% filter(birth_cohort == bc)
+  fit <- lmer(distance ~ age_c + age_c2 + (1 + age_c | player_name), data = d, control = lmerControl(optimizer = "bobyqa"))
+  fe <- fixef(fit)
+  tibble(birth_cohort = bc, age_c_coef = fe[["age_c"]], age_c2_coef = fe[["age_c2"]],
+         vertex_age_c = -fe[["age_c"]] / (2 * fe[["age_c2"]]))
+})
+
+vertex_by_cohort %>% print()
+```
+
+**Finding:** the per-cohort vertex estimates are physically implausible
+and inconsistent — `age_c2_coef` even flips sign between cohorts, and the
+implied vertex ages (in centered units) range from
+`r round(min(vertex_by_cohort$vertex_age_c), 1)` to
+`r round(max(vertex_by_cohort$vertex_age_c), 1)`, nowhere close to a
+believable "peak age." This formula should not be quoted as a real number
+from this data.
+
+## 4.1 Nonparametric alternative: age at personal-best distance
+
+```{r personal-best-age}
+personal_peak <- df_3plus %>%
+  filter(birth_cohort != "2000s+") %>%
+  group_by(player_name, birth_cohort) %>%
+  slice_max(distance, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+still_active <- df_3plus %>%
+  filter(birth_cohort != "2000s+") %>%
+  group_by(player_name, birth_cohort) %>%
+  summarise(last_year = max(year), .groups = "drop") %>%
+  mutate(active = last_year >= 2023)
+
+peak_summary <- personal_peak %>%
+  group_by(birth_cohort) %>%
+  summarise(median_peak_age = median(age), n = n(), .groups = "drop") %>%
+  left_join(still_active %>% group_by(birth_cohort) %>% summarise(pct_active = round(mean(active) * 100, 1), .groups = "drop"),
+            by = "birth_cohort")
+
+peak_summary %>% print()
+```
+
+```{r personal-best-plot}
+p_personal_peak <- ggplot(peak_summary, aes(birth_cohort, median_peak_age)) +
+  geom_col(fill = COL_PRIMARY) +
+  geom_text(aes(label = paste0(pct_active, "% still active")), vjust = -0.5, size = 3.2) +
+  labs(
+    title    = "Median Age at Personal-Best Distance, by Birth Cohort",
+    subtitle = "Cohorts with a high '% still active' have incomplete careers - their number is a lower bound, not settled",
+    x = NULL, y = "Median age at personal-best distance"
+  ) +
+  THEME_BASE +
+  ylim(0, max(peak_summary$median_peak_age) * 1.2)
+
+p_personal_peak
+```
+
+**Finding:** median age-at-personal-best declines steadily by birth
+cohort — `r peak_summary$median_peak_age[peak_summary$birth_cohort=="Pre-1970"]`
+(Pre-1970) →
+`r peak_summary$median_peak_age[peak_summary$birth_cohort=="1990s"]`
+(1990s) — but this is **not an apples-to-apples comparison**. Pre-1970's
+careers are `r peak_summary$pct_active[peak_summary$birth_cohort=="Pre-1970"]`%
+still active (fully observed, reliable), while 1990s is
+`r peak_summary$pct_active[peak_summary$birth_cohort=="1990s"]`% still
+active — most of that cohort hasn't had the chance to record a new
+personal best in their 30s yet, so their number is a **lower bound** that
+will likely rise, not a settled finding.
+
+---
+
+# 5. Cohort Trajectory
+
+Distance aligned by years-since-entry (`year - entry_year`, using the
+cross-referenced `entry_year` from `00_data_engineering.Rmd` — no rebuild
+needed), by `birth_cohort`.
+
+```{r cohort-trajectory}
+cohort_traj <- df_3plus %>%
+  filter(birth_cohort != "2000s+") %>%
+  mutate(years_since_entry = year - entry_year) %>%
+  filter(years_since_entry >= 0, years_since_entry <= 15) %>%
+  group_by(birth_cohort, years_since_entry) %>%
+  summarise(mean_distance = mean(distance), n = n(), .groups = "drop") %>%
+  filter(n >= 5)
+
+p_cohort_traj <- ggplot(cohort_traj, aes(years_since_entry, mean_distance, color = birth_cohort)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  labs(
+    title = "Distance Trajectory by Years Since Tour Entry, by Birth Cohort",
+    x = "Years since entry", y = "Mean Distance (yds)", color = NULL
+  ) +
+  THEME_BASE
+
+p_cohort_traj
+```
+
+**Finding:** at the same career stage (years since entry), later-born
+cohorts sit at a higher distance level throughout — consistent with the
+field-wide rise documented in Project 1, now shown to hold at every
+common career stage, not just in aggregate.
+
+---
+
+# 6. Rookie Entry Speed Over Time
+
+Using the already-engineered `dist_entry`/`speed_entry`/`sg_entry_year` —
+these reflect each player's first *strokes-gained-era* season specifically
+(not the cross-referenced `entry_year`), since ball speed doesn't exist
+before 2004 at all and isn't reliable before `SPEED_ERA_START` (2007). The
+x-axis here is `sg_entry_year` for that reason, not `entry_year`.
+
+```{r rookie-entry-speed}
+entry_dist_data <- df_main %>% distinct(player_name, sg_entry_year, dist_entry)
+
+entry_speed_data <- df_main %>%
+  distinct(player_name, sg_entry_year, speed_entry) %>%
+  filter(sg_entry_year >= SPEED_ERA_START, !is.na(speed_entry))
+
+cat("Players with dist_entry:                    ", nrow(entry_dist_data), "\n")
+cat("Players with speed_entry (sg_entry_year >=", SPEED_ERA_START, "):", nrow(entry_speed_data), "\n")
+
+p_entry_dist <- ggplot(entry_dist_data, aes(sg_entry_year, dist_entry)) +
+  geom_point(alpha = 0.4, color = COL_PRIMARY) +
+  geom_smooth(method = "lm", se = TRUE, color = COL_ACCENT) +
+  labs(title = "Rookie-Season Distance by SG-Era Entry Year", x = NULL, y = "Distance (yds)") +
+  THEME_BASE
+
+p_entry_speed <- ggplot(entry_speed_data, aes(sg_entry_year, speed_entry)) +
+  geom_point(alpha = 0.4, color = COL_SECONDARY) +
+  geom_smooth(method = "lm", se = TRUE, color = COL_ACCENT) +
+  labs(title = "Rookie-Season Ball Speed by SG-Era Entry Year", x = NULL, y = "Ball Speed (mph)") +
+  THEME_BASE
+
+p_entry_dist
+p_entry_speed
+```
+
+**Finding:** the speed portion of this analysis uses only
+`r nrow(entry_speed_data)` of `r nrow(entry_dist_data)` players
+(`r round(100*nrow(entry_speed_data)/nrow(entry_dist_data),0)`%) — anyone
+whose first SG-era season was 2004-2006 has no ball speed data at all.
+Both rookie distance and rookie ball speed trend upward with entry year —
+newer entrants arrive already hitting it farther and faster, not just
+catching up once on tour.
+
+---
+
+# 7. Mundlak Decomposition
+
+Separates the *between-player* effect of distance (do longer hitters
+systematically differ?) from the *within-player* effect (does a player's
+own distance change matter, holding their identity fixed?), alongside age.
+
+```{r mundlak}
+df_mundlak <- df_3plus %>% mutate(age_c2 = (age - mean(age))^2)
+
+fit_mundlak <- lm(distance ~ year + dist_player_mean + dist_within + age + age_c2, data = df_mundlak)
+
+tidy(fit_mundlak) %>% print()
+```
+
+```{r mundlak-plot}
+mundlak_coefs <- tidy(fit_mundlak) %>% filter(term != "(Intercept)")
+
+p_mundlak <- ggplot(mundlak_coefs, aes(estimate, fct_reorder(term, estimate))) +
+  geom_col(fill = COL_PRIMARY) +
+  geom_errorbarh(aes(xmin = estimate - 1.96 * std.error, xmax = estimate + 1.96 * std.error), height = 0.2) +
+  labs(title = "Mundlak Decomposition: Distance ~ Year + Between/Within + Age", x = "Coefficient", y = NULL) +
+  THEME_BASE
+
+p_mundlak
+```
+
+**Finding:** `dist_player_mean` (the between-player term) dwarfs
+`dist_within` — most of the variation in a row's distance is explained by
+*which player* it is (their career-average power level), not by that
+player deviating from their own norm in a given season. This is the
+standard Mundlak pattern and confirms panel models elsewhere in this
+project are right to separate the two rather than pool them.
+
+---
+
+# 8. Age Groups: Composition and Relative Standing Over Time
+
+```{r age-groups-setup}
+df_main <- df_main %>%
+  mutate(age_group = case_when(
+    age < 30 ~ "Under 30",
+    age < 35 ~ "30-34",
+    age < 40 ~ "35-39",
+    TRUE     ~ "40+"
+  ) %>% factor(levels = c("Under 30", "30-34", "35-39", "40+")))
+```
+
+## 8.1 Compositional shift
+
+```{r age-group-composition}
+age_comp <- df_main %>%
+  count(year, age_group) %>%
+  group_by(year) %>%
+  mutate(pct = 100 * n / sum(n)) %>%
+  ungroup()
+
+p_age_comp <- ggplot(age_comp, aes(year, pct, fill = age_group)) +
+  geom_area(position = "stack") +
+  labs(title = "Age Composition of the Field Over Time", x = NULL, y = "% of field", fill = NULL) +
+  THEME_BASE
+
+p_age_comp
+```
+
+```{r age-comp-findings}
+share40_2004 <- age_comp %>% filter(year == min(year), age_group == "40+") %>% pull(pct)
+share40_2025 <- age_comp %>% filter(year == max(year), age_group == "40+") %>% pull(pct)
+```
+
+**Finding:** the 40+ share of the field collapsed from
+`r round(share40_2004, 1)`% (2004) to `r round(share40_2025, 1)`% (2025) —
+a striking, direct answer to "are older players being pushed off tour":
+yes, dramatically so.
+
+## 8.2 Relative standing by age group over time
+
+Not just absolute values — is each age group pulling ahead of or falling
+behind *the rest of the field that same year*?
+
+```{r age-group-relative-standing}
+relative_by_group <- bind_rows(
+  df_main %>% group_by(year, age_group) %>% summarise(value = mean(dist_vs_field), .groups = "drop") %>% mutate(metric = "Distance vs. field"),
+  df_main %>% filter(year >= SPEED_ERA_START) %>% group_by(year, age_group) %>% summarise(value = mean(speed_vs_field), .groups = "drop") %>% mutate(metric = "Ball speed vs. field"),
+  df_main %>% filter(year >= SPEED_ERA_START) %>% group_by(year, age_group) %>% summarise(value = mean(chs_vs_field), .groups = "drop") %>% mutate(metric = "CHS vs. field"),
+  df_main %>% group_by(year, age_group) %>% summarise(value = mean(acc_vs_field), .groups = "drop") %>% mutate(metric = "Accuracy vs. field")
+)
+
+p_relative <- ggplot(relative_by_group, aes(year, value, color = age_group)) +
+  geom_line(linewidth = 0.9) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  facet_wrap(~metric, scales = "free_y") +
+  labs(title = "Age Group Standing Relative to the Field, Over Time", x = NULL, y = NULL, color = NULL) +
+  THEME_BASE
+
+p_relative
+```
+
+```{r relative-findings}
+dist_gap <- relative_by_group %>% filter(metric == "Distance vs. field", age_group %in% c("Under 30", "40+")) %>%
+  pivot_wider(id_cols = year, names_from = age_group, values_from = value) %>%
+  mutate(gap = `Under 30` - `40+`)
+
+gap_2004 <- dist_gap %>% filter(year == min(year)) %>% pull(gap)
+gap_2025 <- dist_gap %>% filter(year == max(year)) %>% pull(gap)
+gap_trend <- tidy(lm(gap ~ year, data = dist_gap)) %>% filter(term == "year")
+```
+
+**Finding:** initial read looked like a widening gap (2004:
+`r round(gap_2004, 1)` yds → 2025: `r round(gap_2025, 1)` yds), but fitting
+a trend line to the full series shows that's just two noisy endpoints —
+the year-over-year slope is
+`r round(gap_trend$estimate, 3)` yds/year (t =
+`r round(gap_trend$statistic, 2)`, not significant). The Under-30-vs-40+
+gap fluctuates between roughly 5.6 and 12.1 yards across the whole window
+with **no systematic trend either way** — both age groups have moved up
+together. This actually reinforces Project 1's "uniform shift" finding
+rather than contradicting it: the rise hasn't disproportionately favored
+the young at older players' relative expense, it's lifted age groups in
+step with each other, at least as measured by this age-vs-field gap.
+
+---
+
+# 9. Individual Trajectories: Prime (30-34) vs. 40+
+
+**This section describes a survivor population, not a general aging
+claim.** Only players observed both in a "prime" band (age 30-34) and
+later at 40+ are included — by construction, everyone here already stuck
+around long enough to reach 40+ on tour. The question this section answers
+is "what does the relative standing of tour survivors look like at 40+
+compared to their own prime," not "what happens to golfers in general as
+they age" (an earlier, cruder comparison — median individual age-slope for
+"ever reached 40+" vs. everyone else — was tested and found confounded by
+career length, not used here).
+
+```{r prime-vs-40}
+compute_prime_vs_40 <- function(metric_col, speed_era_only = FALSE) {
+  d <- df_main %>%
+    filter(age >= 30, age <= 34 | age >= 40) %>%
+    mutate(band = if_else(age <= 34, "prime", "b40"))
+  if (speed_era_only) d <- d %>% filter(year >= SPEED_ERA_START)
+
+  d %>%
+    group_by(player_name, band) %>%
+    summarise(m = mean(.data[[metric_col]], na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = band, values_from = m) %>%
+    filter(!is.na(prime), !is.na(b40)) %>%
+    mutate(change = b40 - prime, metric = metric_col)
+}
+
+prime_vs_40_all <- bind_rows(
+  compute_prime_vs_40("dist_vs_field"),
+  compute_prime_vs_40("sg_ott"),
+  compute_prime_vs_40("speed_vs_field", speed_era_only = TRUE),
+  compute_prime_vs_40("chs_vs_field", speed_era_only = TRUE)
+)
+
+metric_labels <- c(
+  dist_vs_field = "Distance vs. field (yds)", sg_ott = "SG_OTT",
+  speed_vs_field = "Ball speed vs. field (mph)", chs_vs_field = "CHS vs. field (mph)"
+)
+
+summary_table <- prime_vs_40_all %>%
+  group_by(metric) %>%
+  summarise(n = n(), median_change = median(change), pct_maintained = 100 * mean(change >= 0), .groups = "drop")
+
+summary_table %>% print()
+```
+
+```{r prime-vs-40-plot}
+p_prime_vs_40 <- ggplot(prime_vs_40_all, aes(change)) +
+  geom_histogram(bins = 20, fill = COL_PRIMARY, alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = COL_ACCENT, linewidth = 1) +
+  facet_wrap(~metric, scales = "free", labeller = as_labeller(metric_labels)) +
+  labs(
+    title    = "Change From Prime (30-34) to 40+, Among Players Observed in Both",
+    subtitle = "Dashed line: no change. Left of the line = decline relative to the field.",
+    x = "Change (40+ minus prime)", y = "Number of players"
+  ) +
+  THEME_BASE
+
+p_prime_vs_40
+```
+
+**Finding:** even among players who stuck around long enough to be
+observed at 40+, the large majority show real relative decline from their
+own prime — only
+`r round(summary_table$pct_maintained[summary_table$metric=="dist_vs_field"], 1)`%
+maintained or improved distance-vs-field,
+`r round(summary_table$pct_maintained[summary_table$metric=="speed_vs_field"], 1)`%
+for ball speed. **SG_OTT holds up noticeably better**
+(`r round(summary_table$pct_maintained[summary_table$metric=="sg_ott"], 1)`%
+maintained or improved) than the raw physical metrics — since SG_OTT
+captures the whole tee-shot outcome, not just raw power, this suggests
+some players partially offset physical decline with course management or
+shot-shaping, even when their underlying speed and distance numbers don't
+hold up.
+
+---
+
+# 10. Summary
+
+- **The population age-distance curve is closer to a plateau/decline than
+  a clean parabola** — the quadratic term isn't significant, likely
+  because players enter this dataset already near their physical peak.
+  The docs' vertex-formula "peak age" is not a reliable number here,
+  pooled or per-cohort.
+- **Age-at-personal-best is directionally interesting (42→34→33→29 across
+  cohorts) but the newer cohorts' numbers are lower bounds** — most of the
+  1980s/1990s cohorts are still active and haven't had their full careers
+  observed yet.
+- **The 40+ share of the field has collapsed** (31.3%→8.3%, 2004-2025), but
+  the Under-30-vs-40+ *relative distance gap has not widened* — it's
+  fluctuated with no significant trend across the whole window. Older
+  players are vanishing from the tour, but the ones who remain haven't
+  fallen further behind young players specifically; both groups have
+  risen together.
+- **Even the tour "survivors" who reach 40+ mostly decline relative to
+  their own prime** (only 6-19% maintain or improve, depending on the
+  metric) — reinforcing, not contradicting, the compositional finding:
+  staying on tour past 40 is rare, and even those who manage it are
+  usually playing at a real relative disadvantage compared to their own
+  best years.
+
+---
+
+# 11. Session Info
+
+```{r session-info}
+sessionInfo()
+```

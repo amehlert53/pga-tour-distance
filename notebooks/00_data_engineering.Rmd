@@ -123,9 +123,19 @@ df_raw %>%
     distance_out_of_range = sum(distance < 200 | distance > 350, na.rm = TRUE),
     ball_speed_out_of_range = sum(ball_speed < 140 | ball_speed > 200, na.rm = TRUE),
     chs_out_of_range = sum(chs < 90 | chs > 140, na.rm = TRUE),
-    carry_out_of_range = sum(carry_distance < 200 | carry_distance > 320, na.rm = TRUE)
+    carry_out_of_range = sum(carry_distance < 200 | carry_distance > 320, na.rm = TRUE),
+    age_out_of_range = sum(age < 18 | age > 55, na.rm = TRUE)
   ) %>%
   print()
+
+# Age specifically: print the offending rows, since an out-of-range age
+# usually points to a birth_year data error rather than a true outlier
+# (found via Project 6: "Patrick Sheehan" has 6 rows sharing a birth_year
+# that implies ages 12-20, inconsistent with that same row's turned_pro -
+# almost certainly two different real people merged under one name).
+df_raw %>%
+  filter(age < 18 | age > 55) %>%
+  select(player_name, year, age, birth_year, turned_pro)
 ```
 
 ## 2.2 Initial inspection — df_trends
