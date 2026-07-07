@@ -1,0 +1,500 @@
+---
+title: "05 — Player Archetypes"
+subtitle: "PGA Tour Distance & Speed Analytics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+# Overview
+
+**Question:** Has the physical and statistical profile of a successful
+PGA Tour player changed? Are bombers more represented among top performers
+now?
+
+**Data:** `df_main` (2004–2025). The quadrant `archetype` variable
+(Long/Accurate, Long/Inaccurate, Short/Accurate, Short/Inaccurate) is
+already engineered in `00_data_engineering.Rmd` — this notebook builds on
+it rather than re-deriving it.
+
+**Two scope decisions made by testing, not assumed, before writing any of
+the sections below:**
+
+1. **"Run clustering at 3 eras" — which 3?** `config.R` already defines 5
+   eras (`ERA_BREAKS`/`ERA_LABELS`), but `df_main` only starts in 2004, so
+   only 3 of the 5 actually have data here — Ball Tech Era, Modern Era,
+   Power Era. Reused directly rather than inventing new cutoffs.
+2. **How many clusters (k)?** Silhouette width favors k=2-3 in every era
+   tested, declining gently (not a sharp elbow) through k=6. k=4 is used
+   deliberately anyway — it's a small step down in silhouette width, but
+   gives interpretable, comparably-sized clusters that map onto the
+   existing 4-quadrant heuristic. Stated explicitly in section 3, not
+   silently decided.
+
+**A section beyond the original docs, added on request:** section 6
+clusters on the four Strokes Gained categories directly (not
+distance/accuracy) to see what "game style" archetypes look like and how
+much off-the-tee specifically drives them.
+
+---
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+# Core
+library(tidyverse)
+library(here)
+
+# Modeling
+library(cluster)   # silhouette width (sections 3, 6)
+
+# Utilities
+library(broom)
+library(scales)
+
+source(here::here("config.R"))
+
+set.seed(2025)
+
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+`coord_radar()` isn't built into `ggplot2` — the standard workaround for a
+straight-edged (not curved-arc) polar polygon, used in section 5.
+
+```{r coord-radar-helper}
+coord_radar <- function(theta = "x", start = 0, direction = 1) {
+  theta <- match.arg(theta, c("x", "y"))
+  r <- if (theta == "x") "y" else "x"
+  ggproto("CordRadar", CoordPolar, theta = theta, r = r,
+          start = start, direction = sign(direction),
+          is_linear = function(coord) TRUE)
+}
+```
+
+---
+
+# 2. Load Data
+
+```{r load-data}
+df_main <- readRDS(here(PATH_PROCESSED, "df_main.rds")) %>%
+  mutate(era = cut(year, breaks = ERA_BREAKS, labels = ERA_LABELS, include.lowest = TRUE, right = TRUE))
+
+cat("Rows:          ", nrow(df_main), "\n")
+cat("Unique players:", n_distinct(df_main$player_name), "\n\n")
+cat("Rows by era (only eras with data in this 2004-2025 window will be non-zero):\n")
+print(df_main %>% count(era))
+```
+
+**Finding:** as expected, only 3 of the 5 configured eras have any data in
+this window — Ball Tech Era, Modern Era, Power Era — confirming the "3
+eras" for clustering (section 3) falls directly out of existing project
+infrastructure rather than being invented for this notebook.
+
+---
+
+# 3. Quadrant Classification (Given) + Quadrant Scatter by Era
+
+`archetype` was already engineered in `00_data_engineering.Rmd` from
+`dist_vs_field`/`acc_vs_field` sign — reused here, not re-derived.
+
+```{r quadrant-scatter}
+p_quadrant <- df_main %>%
+  filter(!is.na(era)) %>%
+  ggplot(aes(dist_vs_field, acc_vs_field, color = archetype)) +
+  geom_point(alpha = 0.4, size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  facet_wrap(~era) +
+  scale_color_manual(values = c(
+    "Long / Accurate"    = COL_PRIMARY,
+    "Long / Inaccurate"  = COL_ACCENT,
+    "Short / Accurate"   = COL_SECONDARY,
+    "Short / Inaccurate" = COL_NEUTRAL
+  )) +
+  labs(
+    title = "Distance vs. Accuracy Quadrant, by Era",
+    x = "Distance vs. field (yds)", y = "Accuracy vs. field (%)", color = NULL
+  ) +
+  THEME_BASE
+
+p_quadrant
+```
+
+```{r quadrant-findings}
+quadrant_by_era <- df_main %>%
+  filter(!is.na(era)) %>%
+  count(era, archetype) %>%
+  group_by(era) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ungroup()
+
+quadrant_by_era %>% pivot_wider(id_cols = archetype, names_from = era, values_from = pct) %>% print()
+```
+
+**Finding:** the quadrant shares shift only modestly era to era — this
+simple heuristic is fairly stable over time. The more interesting movement
+shows up in sections 4-6 below, which condition on *performance*
+(top-25% SG_total) rather than looking at the whole field.
+
+---
+
+# 4. K-Means Clustering at 3 Eras
+
+Same 4 variables as the docs specify (`dist_vs_field`, `acc_vs_field`,
+`sg_ott`, `sg_putt`), scaled, clustered separately within each of the 3
+eras from section 2 — not pooled, since the point is comparing whether the
+*shape* of player archetypes differs by era.
+
+```{r silhouette-table}
+cluster_vars <- c("dist_vs_field", "acc_vs_field", "sg_ott", "sg_putt")
+eras_present <- levels(droplevels(df_main$era))
+
+compute_silhouette <- function(era_name, k) {
+  era_data <- df_main %>% filter(era == era_name) %>% select(all_of(cluster_vars)) %>% scale()
+  km <- kmeans(era_data, centers = k, nstart = 25)
+  mean(silhouette(km$cluster, dist(era_data))[, 3])
+}
+
+sil_table <- expand_grid(era = eras_present, k = 2:6) %>%
+  mutate(silhouette = map2_dbl(era, k, compute_silhouette)) %>%
+  pivot_wider(names_from = k, values_from = silhouette, names_prefix = "k")
+
+sil_table %>% print()
+```
+
+**Silhouette width favors k=2-3 in every era, declining gently rather than
+showing a sharp elbow.** We use k=4 anyway: the drop from k=2 to k=4 is
+small (not a cliff — see the table above), and k=4 gives clusters that can
+be compared directly against the existing 4-quadrant heuristic, which is
+more useful for this project's narrative than the marginally higher
+silhouette width of a 2-cluster split.
+
+```{r kmeans-by-era}
+run_kmeans_era <- function(era_name, k = 4) {
+  set.seed(2025)
+  era_data_raw <- df_main %>% filter(era == era_name) %>% select(all_of(cluster_vars))
+  era_scaled <- scale(era_data_raw)
+  km <- kmeans(era_scaled, centers = k, nstart = 25)
+  centers_unscaled <- sweep(sweep(km$centers, 2, attr(era_scaled, "scaled:scale"), `*`), 2, attr(era_scaled, "scaled:center"), `+`)
+  as_tibble(centers_unscaled) %>% mutate(cluster = row_number(), era = era_name, size = km$size)
+}
+
+cluster_centers_by_era <- map_dfr(eras_present, run_kmeans_era) %>%
+  mutate(era = factor(era, levels = eras_present))
+
+cluster_centers_by_era %>% print()
+```
+
+```{r cluster-heatmap}
+p_cluster_heatmap <- cluster_centers_by_era %>%
+  pivot_longer(all_of(cluster_vars), names_to = "variable", values_to = "value") %>%
+  group_by(variable) %>%
+  mutate(value_z = as.numeric(scale(value))) %>%
+  ungroup() %>%
+  ggplot(aes(variable, factor(cluster), fill = value_z)) +
+  geom_tile() +
+  facet_wrap(~era) +
+  scale_fill_gradient2(low = COL_ACCENT, mid = "white", high = COL_PRIMARY, name = "Relative\nlevel") +
+  labs(title = "Cluster Profiles by Era (Standardized Across All Era-Clusters)", x = NULL, y = "Cluster") +
+  THEME_BASE
+
+p_cluster_heatmap
+```
+
+**Finding:** the same rough 4-archetype structure (a long-and-inaccurate
+group, an accurate-but-short group, etc.) recurs in all 3 eras — clustering
+doesn't reveal a qualitatively new player type emerging, it's the same
+handful of shapes, just shifted along the distance axis as the whole field
+got longer (consistent with Project 1's "uniform shift" finding).
+
+---
+
+# 5. Archetype Share Among Top-25% SG_total Performers, by Year
+
+The whole-field quadrant shares (section 3) were fairly stable — but what
+about specifically among the *best* players each year? This is the section
+that most directly answers "are bombers more represented among top
+performers."
+
+```{r archetype-share}
+top25_by_year <- df_main %>%
+  group_by(year) %>%
+  mutate(sg_rank_pct = percent_rank(sg_total)) %>%
+  ungroup() %>%
+  filter(sg_rank_pct >= 0.75)
+
+archetype_share <- top25_by_year %>%
+  count(year, archetype) %>%
+  group_by(year) %>%
+  mutate(pct = 100 * n / sum(n)) %>%
+  ungroup()
+
+p_archetype_share <- ggplot(archetype_share, aes(year, pct, fill = archetype)) +
+  geom_area(position = "stack") +
+  scale_fill_manual(values = c(
+    "Long / Accurate"    = COL_PRIMARY,
+    "Long / Inaccurate"  = COL_ACCENT,
+    "Short / Accurate"   = COL_SECONDARY,
+    "Short / Inaccurate" = COL_NEUTRAL
+  )) +
+  labs(
+    title    = "Archetype Share Among Top-25% SG_total Performers",
+    x = NULL, y = "Share of top-25% performers (%)", fill = NULL
+  ) +
+  THEME_BASE
+
+p_archetype_share
+```
+
+```{r archetype-share-findings}
+la_2004 <- archetype_share %>% filter(year == min(year), archetype == "Long / Accurate") %>% pull(pct)
+la_2025 <- archetype_share %>% filter(year == max(year), archetype == "Long / Accurate") %>% pull(pct)
+li_2004 <- archetype_share %>% filter(year == min(year), archetype == "Long / Inaccurate") %>% pull(pct)
+li_2025 <- archetype_share %>% filter(year == max(year), archetype == "Long / Inaccurate") %>% pull(pct)
+```
+
+**Finding:** "Long/Accurate" share rose from `r round(la_2004, 1)`% (2004)
+to `r round(la_2025, 1)`% (2025), while "Long/Inaccurate" — the pure
+"bomber" archetype — *fell* from `r round(li_2004, 1)`% to
+`r round(li_2025, 1)`%. The popular "bombers are taking over" framing
+undersells what's actually happening: the most successful profile now
+combines distance *with* accuracy, rather than trading one for the other.
+
+---
+
+# 6. Era Comparison: MANOVA + Radar Chart
+
+Same top-25%-SG_total population, contrasting Early (2004-2010) vs. Late
+(2018-2025) — skipping the middle "Modern Era" for a clean two-group test,
+using the outer two of the 3 eras from section 4.
+
+```{r manova}
+early <- top25_by_year %>% filter(year >= 2004, year <= 2010) %>% mutate(era_grp = "Early (2004-2010)")
+late  <- top25_by_year %>% filter(year >= 2018, year <= 2025) %>% mutate(era_grp = "Late (2018-2025)")
+combined <- bind_rows(early, late)
+
+cat("n early:", nrow(early), " n late:", nrow(late), "\n")
+
+Y <- as.matrix(combined %>% select(all_of(cluster_vars)))
+fit_manova <- manova(Y ~ era_grp, data = combined)
+summary(fit_manova, test = "Pillai")
+```
+
+```{r manova-profile}
+profile_by_era <- combined %>%
+  group_by(era_grp) %>%
+  summarise(across(all_of(cluster_vars), mean), .groups = "drop")
+
+profile_by_era %>% print()
+```
+
+**Finding:** the MANOVA is highly significant
+(Pillai's trace, p < 0.001) — the multivariate profile of top performers
+has genuinely shifted, not just distance in isolation.
+`dist_vs_field` roughly tripled
+(`r round(profile_by_era$dist_vs_field[profile_by_era$era_grp=="Early (2004-2010)"], 2)` →
+`r round(profile_by_era$dist_vs_field[profile_by_era$era_grp=="Late (2018-2025)"], 2)`)
+**and** `acc_vs_field` also grew
+(`r round(profile_by_era$acc_vs_field[profile_by_era$era_grp=="Early (2004-2010)"], 2)` →
+`r round(profile_by_era$acc_vs_field[profile_by_era$era_grp=="Late (2018-2025)"], 2)`) —
+top performers pulled further ahead of the field on *both* axes, not by
+trading one for the other. This nuances Project 1's field-wide finding
+(the distance-accuracy trade-off has strengthened *overall*): true for the
+field generally, but the very best players increasingly buck that
+trade-off.
+
+## 6.1 Radar chart
+
+Each variable standardized across the pooled early+late population first
+(not just the two era-means — standardizing only two aggregate points
+would force every variable to an identical, meaningless spread), then
+averaged within era.
+
+```{r radar-chart}
+combined_z <- combined %>%
+  mutate(across(all_of(cluster_vars), ~as.numeric(scale(.x)), .names = "z_{.col}"))
+
+radar_data <- combined_z %>%
+  group_by(era_grp) %>%
+  summarise(across(starts_with("z_"), mean), .groups = "drop") %>%
+  pivot_longer(-era_grp, names_to = "variable", values_to = "value") %>%
+  mutate(variable = str_remove(variable, "^z_"))
+
+radar_closed <- radar_data %>%
+  group_by(era_grp) %>%
+  group_modify(~bind_rows(.x, .x[1, ])) %>%
+  ungroup() %>%
+  mutate(variable = factor(variable, levels = unique(variable)))
+
+p_radar <- ggplot(radar_closed, aes(x = variable, y = value, group = era_grp, color = era_grp)) +
+  geom_polygon(aes(fill = era_grp), alpha = 0.15, linewidth = 1) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("Early (2004-2010)" = COL_SECONDARY, "Late (2018-2025)" = COL_PRIMARY)) +
+  scale_fill_manual(values = c("Early (2004-2010)" = COL_SECONDARY, "Late (2018-2025)" = COL_PRIMARY)) +
+  coord_radar() +
+  labs(title = "Top-25% SG_total Performer Profile: Early vs. Late Era", color = NULL, fill = NULL) +
+  THEME_BASE
+
+p_radar
+```
+
+**Finding:** the "Late" polygon fully encloses "Early" on all 4 axes — a
+direct visual confirmation of the MANOVA result, not just a statistical
+abstraction.
+
+---
+
+# 7. SG-Category Clustering (Added Analysis)
+
+Beyond distance/accuracy, what does clustering purely on the 4 Strokes
+Gained categories reveal about game-*style* archetypes, and how much does
+off-the-tee specifically drive them? Each component is standardized
+**within year first** (not raw) — Project 3 already found SG_OTT's
+importance has been rising over time, and we don't want that secular drift
+conflated with player-style differences here.
+
+```{r sg-cluster-setup}
+df_sg <- df_main %>%
+  group_by(year) %>%
+  mutate(across(c(sg_ott, sg_apr, sg_arg, sg_putt), ~as.numeric(scale(.x)), .names = "z_{.col}")) %>%
+  ungroup()
+
+sg_cluster_vars <- c("z_sg_ott", "z_sg_apr", "z_sg_arg", "z_sg_putt")
+X_sg <- df_sg %>% select(all_of(sg_cluster_vars)) %>% as.matrix()
+
+sil_sg <- map_dbl(2:6, function(k) {
+  set.seed(2025)
+  km <- kmeans(X_sg, centers = k, nstart = 25)
+  mean(silhouette(km$cluster, dist(X_sg))[, 3])
+})
+
+cat("Silhouette scores k=2..6 (SG-component clustering, full 2004-2025):\n")
+print(setNames(round(sil_sg, 3), 2:6))
+```
+
+Same tradeoff as section 4 — silhouette gently prefers fewer clusters, k=4
+used again for interpretability and consistency with the rest of the
+notebook.
+
+```{r sg-cluster-fit}
+set.seed(2025)
+km_sg <- kmeans(X_sg, centers = 4, nstart = 25)
+df_sg$sg_cluster <- factor(km_sg$cluster)
+
+centers_sg <- as_tibble(km_sg$centers) %>%
+  mutate(cluster = row_number(), size = km_sg$size) %>%
+  mutate(label = case_when(
+    z_sg_ott > 0 & z_sg_apr > 0 & z_sg_arg > 0 & z_sg_putt > 0 ~ "All-around positive",
+    z_sg_putt < -0.5 & z_sg_ott > 0 & z_sg_apr > 0             ~ "Ball-striker, weak putter",
+    z_sg_ott < -0.5 & z_sg_apr < -0.5                          ~ "Weak long game",
+    TRUE                                                       ~ paste("Cluster", cluster)
+  ))
+
+centers_sg %>% print()
+```
+
+```{r sg-differentiation}
+ranges <- centers_sg %>%
+  summarise(across(all_of(sg_cluster_vars), ~max(.x) - min(.x))) %>%
+  pivot_longer(everything(), names_to = "component", values_to = "range") %>%
+  arrange(range)
+
+ranges %>% print()
+```
+
+**Finding:** off-the-tee (`z_sg_ott`) has the **smallest** range across the
+4 cluster centers (`r round(ranges$range[ranges$component=="z_sg_ott"], 2)`)
+— it's the *least* differentiating category. Putting and around-the-green
+have the largest ranges, meaning short game creates the sharpest splits
+between player archetypes, not off-the-tee. This cuts against a
+distance-centric read of what separates player styles.
+
+## 7.1 Cluster Share Among Top Performers, by Year
+
+```{r sg-cluster-share}
+df_sg <- df_sg %>% group_by(year) %>% mutate(sg_rank_pct = percent_rank(sg_total)) %>% ungroup()
+top25_sg <- df_sg %>%
+  filter(sg_rank_pct >= 0.75) %>%
+  left_join(centers_sg %>% select(cluster, label) %>% mutate(cluster = factor(cluster)), by = c("sg_cluster" = "cluster"))
+
+sg_share <- top25_sg %>%
+  count(year, label) %>%
+  group_by(year) %>%
+  mutate(pct = 100 * n / sum(n)) %>%
+  ungroup()
+
+p_sg_share <- ggplot(sg_share, aes(year, pct, fill = label)) +
+  geom_area(position = "stack") +
+  labs(
+    title    = "SG-Category Cluster Share Among Top-25% SG_total Performers",
+    subtitle = "Game-style archetype, not distance/accuracy",
+    x = NULL, y = "Share of top-25% performers (%)", fill = NULL
+  ) +
+  THEME_BASE
+
+p_sg_share
+```
+
+```{r sg-share-findings}
+allaround_label <- centers_sg$label[centers_sg$label == "All-around positive"][1]
+ballstriker_label <- centers_sg$label[centers_sg$label == "Ball-striker, weak putter"][1]
+
+allaround_2004 <- sg_share %>% filter(year == min(year), label == allaround_label) %>% pull(pct)
+allaround_2025 <- sg_share %>% filter(year == max(year), label == allaround_label) %>% pull(pct)
+ballstriker_2004 <- sg_share %>% filter(year == min(year), label == ballstriker_label) %>% pull(pct)
+ballstriker_2025 <- sg_share %>% filter(year == max(year), label == ballstriker_label) %>% pull(pct)
+```
+
+**Finding:** the "all-around positive" cluster's share among top-25%
+performers grew from `r round(allaround_2004, 1)`% (2004) to
+`r round(allaround_2025, 1)`% (2025), while "ball-striker, weak putter"
+shrank from `r round(ballstriker_2004, 1)`% to
+`r round(ballstriker_2025, 1)`% — **today's elite players are less
+one-dimensional, not more.** Combined with the finding above (off-the-tee
+is the least differentiating category), the clearest shift among winners
+isn't "more OTT-reliant" — it's fewer one-dimensional profiles, full stop.
+
+---
+
+# 8. Summary
+
+- **Data-driven clustering (on physical attributes) recovers roughly the
+  same 4-shape structure as the hard-coded quadrant heuristic**, in all 3
+  eras — no qualitatively new archetype emerges, the whole cluster
+  structure just shifts along the distance axis as the field got longer.
+- **Archetype share among top performers shifted toward Long/Accurate**,
+  not Long/Inaccurate (14.3%→22.2% vs. 42.9%→33.3%) — "bombers taking
+  over" undersells what's happening.
+- **A highly significant MANOVA confirms it**: top performers pulled ahead
+  of the field on both distance *and* accuracy simultaneously, not by
+  trading one for the other — nuancing Project 1's field-wide
+  trade-off finding, which holds broadly but not among the very best.
+- **SG-category clustering (added this session) reinforces the same
+  story from a different angle**: off-the-tee is the *least*
+  differentiating category among the 4 SG components, and the
+  "all-around positive" style has grown among top performers
+  (58%→~72-75%) at the expense of one-dimensional ball-strikers. The
+  clearest change in what makes a winning profile isn't about the driver
+  specifically — it's about being good at everything.
+
+---
+
+# 9. Session Info
+
+```{r session-info}
+sessionInfo()
+```
