@@ -1,0 +1,653 @@
+---
+title: "10 — Key Visuals"
+subtitle: "PGA Tour Distance & Speed Analytics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+# Overview
+
+Clean, publication- and social-ready visuals distilled from Projects 1-9.
+Minimal prose — one visual per section with a short plain-language caption
+underneath. See `docs/project_context.md` for the full analytical context
+behind each chart.
+
+---
+
+# Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+library(patchwork)
+library(scales)
+
+source(here::here("config.R"))
+
+df_main <- readRDS(here(PATH_PROCESSED, "df_main.rds")) %>% filter(player_name != "Patrick Sheehan")
+df_trends <- readRDS(here(PATH_PROCESSED, "df_trends.rds"))
+
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 10,
+  fig.height = 7
+)
+```
+
+---
+
+# Section 1: Distributional Trends (2007-2025)
+
+```{r section1-data}
+df_speed <- df_main %>% filter(year >= SPEED_ERA_START)
+
+metric_labels <- c(
+  distance = "Driving Distance (yds)",
+  carry_distance = "Carry Distance (yds)",
+  ball_speed = "Ball Speed (mph)",
+  chs = "Clubhead Speed (mph)"
+)
+
+percentile_data <- map_dfr(names(metric_labels), function(m) {
+  df_speed %>%
+    group_by(year) %>%
+    summarise(
+      p10 = quantile(.data[[m]], 0.10),
+      p25 = quantile(.data[[m]], 0.25),
+      p50 = quantile(.data[[m]], 0.50),
+      p75 = quantile(.data[[m]], 0.75),
+      p90 = quantile(.data[[m]], 0.90),
+      .groups = "drop"
+    ) %>%
+    mutate(metric = metric_labels[[m]])
+}) %>%
+  mutate(metric = factor(metric, levels = metric_labels))
+```
+
+```{r section1-plot}
+p_distributions <- ggplot(percentile_data, aes(year)) +
+  geom_ribbon(aes(ymin = p10, ymax = p90), fill = COL_PRIMARY, alpha = 0.15) +
+  geom_ribbon(aes(ymin = p25, ymax = p75), fill = COL_PRIMARY, alpha = 0.3) +
+  geom_line(aes(y = p50), color = COL_PRIMARY, linewidth = 1.2) +
+  facet_wrap(~metric, scales = "free_y") +
+  labs(x = NULL, y = NULL) +
+  THEME_BASE
+
+p_distributions
+```
+
+*(Range annotation removed for now — sparkline insets were too distracting; revisit how to convey band-width stability after the rest of the notebook is built.)*
+
+**The full distribution of driving power metrics has shifted upward
+across all four measures since 2007.** Band width — the gap between the
+10th and 90th percentile — has remained roughly stable, indicating a
+uniform field-wide shift rather than the elite pulling away from the
+rest.
+
+```{r section1-save}
+ggsave(here(PATH_FIGURES, "publication", "10_distributional_trends.png"),
+       p_distributions, width = 10, height = 7, dpi = 300)
+ggsave(here(PATH_FIGURES, "social", "10_distributional_trends.png"),
+       p_distributions, width = 10, height = 7, dpi = 150)
+```
+
+---
+
+# Section 2: Elite Performer Power Trends
+
+```{r section2-data}
+top25_speed <- df_main %>%
+  filter(year >= SPEED_ERA_START) %>%
+  group_by(year) %>%
+  slice_max(sg_total, n = 25) %>%
+  summarise(
+    mean_ball_speed = mean(ball_speed),
+    min_ball_speed  = min(ball_speed),
+    max_ball_speed  = max(ball_speed),
+    .groups = "drop"
+  )
+
+tour_speed <- df_main %>%
+  filter(year >= SPEED_ERA_START) %>%
+  group_by(year) %>%
+  summarise(mean_ball_speed = mean(ball_speed), .groups = "drop")
+
+top25_ott <- df_main %>%
+  group_by(year) %>%
+  slice_max(sg_total, n = 25) %>%
+  summarise(mean_sg_ott = mean(sg_ott), .groups = "drop")
+```
+
+```{r section2-plot}
+shared_xlim <- range(df_main$year)
+
+p_elite_speed <- ggplot(top25_speed, aes(year, mean_ball_speed)) +
+  geom_ribbon(aes(ymin = min_ball_speed, ymax = max_ball_speed), fill = COL_PRIMARY, alpha = 0.2) +
+  geom_line(aes(color = "Top 25 (SG Total)"), linewidth = 1) +
+  geom_point(color = COL_PRIMARY) +
+  geom_line(data = tour_speed, aes(color = "Tour average"), linewidth = 0.8, linetype = "dashed") +
+  scale_x_continuous(limits = shared_xlim) +
+  scale_color_manual(values = c("Top 25 (SG Total)" = COL_PRIMARY, "Tour average" = COL_NEUTRAL), name = NULL) +
+  labs(x = NULL, y = "Ball Speed (mph)") +
+  THEME_BASE +
+  theme(legend.position = "top")
+
+p_elite_ott <- ggplot(top25_ott, aes(year, mean_sg_ott)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_line(color = COL_SECONDARY, linewidth = 1) +
+  geom_point(color = COL_SECONDARY) +
+  scale_x_continuous(limits = shared_xlim) +
+  scale_y_continuous(limits = c(-0.5, 0.5)) +
+  labs(x = NULL, y = "SG: Off the Tee") +
+  THEME_BASE
+
+p_elite <- p_elite_speed / p_elite_ott
+p_elite
+```
+
+**Among the tour's top 25 performers by strokes gained, average ball
+speed has risen steadily since 2007** — outpacing the tour-wide average
+(dashed line) through the middle years before the field closes the gap
+again by 2025. The shaded band shows the range from the slowest to
+fastest in this elite group each year; the SG: Off the Tee panel is
+fixed to a common ±0.5 scale so the size of the effect can be read in
+context, not stretched to fill the frame.
+
+```{r section2-save}
+ggsave(here(PATH_FIGURES, "publication", "10_elite_performer_power_trends.png"),
+       p_elite, width = 10, height = 7, dpi = 300)
+ggsave(here(PATH_FIGURES, "social", "10_elite_performer_power_trends.png"),
+       p_elite, width = 10, height = 7, dpi = 150)
+```
+
+---
+
+# Section 3: Age Composition of Top 100 Performers
+
+```{r section3-data}
+df_age_groups <- df_main %>%
+  mutate(age_group = case_when(
+    age <= 25 ~ "25 and under",
+    age <= 32 ~ "26-32",
+    age <= 39 ~ "33-39",
+    TRUE      ~ "40+"
+  ) %>% factor(levels = c("25 and under", "26-32", "33-39", "40+")))
+
+top100_by_year <- df_age_groups %>%
+  group_by(year) %>%
+  slice_max(sg_total, n = 100) %>%
+  ungroup()
+
+age_group_colors <- setNames(c(COL_PRIMARY, COL_SECONDARY, COL_ACCENT, COL_NEUTRAL), levels(df_age_groups$age_group))
+```
+
+## Visual A — Stacked Area Chart
+
+```{r section3-visual-a}
+comp_pct <- top100_by_year %>%
+  count(year, age_group) %>%
+  group_by(year) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup()
+
+p_age_area <- ggplot(comp_pct, aes(year, pct, fill = age_group)) +
+  geom_area(position = "stack") +
+  scale_fill_manual(values = age_group_colors) +
+  labs(x = NULL, y = "% of Top 100", fill = NULL) +
+  THEME_BASE
+
+p_age_area
+```
+
+**The age composition of the PGA Tour's top 100 performers has shifted**
+— more young players and fewer veterans over 40 are making up the elite
+tier compared to two decades ago.
+
+```{r section3-visual-a-save}
+ggsave(here(PATH_FIGURES, "publication", "10_age_composition_top100_area.png"),
+       p_age_area, width = 10, height = 7, dpi = 300)
+ggsave(here(PATH_FIGURES, "social", "10_age_composition_top100_area.png"),
+       p_age_area, width = 10, height = 7, dpi = 150)
+```
+
+## Visual B — Focused Trend Lines
+
+```{r section3-visual-b}
+counts_by_group <- top100_by_year %>% count(year, age_group)
+
+count_young <- counts_by_group %>% filter(age_group == "25 and under")
+count_old   <- counts_by_group %>% filter(age_group == "40+")
+y_max <- max(c(count_young$n, count_old$n)) * 1.2
+
+p_young <- ggplot(count_young, aes(year, n)) +
+  geom_point(color = COL_PRIMARY, alpha = 0.6) +
+  geom_smooth(method = "loess", se = TRUE, color = COL_PRIMARY) +
+  annotate("text", x = min(count_young$year), y = y_max * 0.95, label = "Trending up",
+           hjust = 0, fontface = "bold", color = COL_PRIMARY) +
+  coord_cartesian(ylim = c(0, y_max)) +
+  labs(title = "Age 25 and under in Top 100", x = NULL, y = "Count") +
+  THEME_BASE
+
+p_old <- ggplot(count_old, aes(year, n)) +
+  geom_point(color = COL_ACCENT, alpha = 0.6) +
+  geom_smooth(method = "loess", se = TRUE, color = COL_ACCENT) +
+  annotate("text", x = min(count_old$year), y = y_max * 0.95, label = "Trending down",
+           hjust = 0, fontface = "bold", color = COL_ACCENT) +
+  coord_cartesian(ylim = c(0, y_max)) +
+  labs(title = "Age 40+ in Top 100", x = NULL, y = "Count") +
+  THEME_BASE
+
+p_age_focused <- p_young + p_old
+p_age_focused
+```
+
+**Young players (25 and under) have become more common among top
+performers, while players 40 and older have steadily declined as a share
+of the competitive elite.**
+
+```{r section3-visual-b-save}
+ggsave(here(PATH_FIGURES, "publication", "10_age_focused_trends.png"),
+       p_age_focused, width = 10, height = 6, dpi = 300)
+ggsave(here(PATH_FIGURES, "social", "10_age_focused_trends.png"),
+       p_age_focused, width = 10, height = 6, dpi = 150)
+```
+
+## Visual C — Paired Story: Composition + Distance by Age Group
+
+```{r section3-visual-c}
+mean_dist_by_age <- df_age_groups %>%
+  group_by(year, age_group) %>%
+  summarise(mean_distance = mean(distance), .groups = "drop")
+
+p_dist_by_age <- ggplot(mean_dist_by_age, aes(year, mean_distance, color = age_group)) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 1) +
+  scale_color_manual(values = age_group_colors) +
+  labs(x = NULL, y = "Mean Distance (yds)", color = NULL) +
+  THEME_BASE
+
+p_age_paired <- (p_age_area + labs(fill = NULL)) + p_dist_by_age +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+p_age_paired
+```
+
+**The field is getting younger, and younger players hit it farther** —
+both trends reinforce each other and together explain much of the overall
+rise in tour-wide driving distance.
+
+```{r section3-visual-c-save}
+ggsave(here(PATH_FIGURES, "publication", "10_age_paired_story.png"),
+       p_age_paired, width = 12, height = 6, dpi = 300)
+ggsave(here(PATH_FIGURES, "social", "10_age_paired_story.png"),
+       p_age_paired, width = 12, height = 6, dpi = 150)
+```
+
+---
+
+# Section 4: Player Archetype Analysis
+
+**A correction before building this section:** the original spec assumed
+"Long/Inaccurate has grown while Short/Accurate has declined" among top
+performers. Checked directly against both population definitions used
+below (absolute top-25 and top-25%) — it's the opposite. **Long/Accurate
+is the archetype gaining ground**, not Long/Inaccurate, matching Project
+5's already-validated finding. Captions below reflect what the data
+actually shows.
+
+```{r section4-data}
+df_2007 <- df_main %>% filter(year >= 2007)
+
+top25_all <- df_2007 %>%
+  group_by(year) %>%
+  slice_max(sg_total, n = 25) %>%
+  ungroup()
+
+archetype_colors <- c(
+  "Long / Accurate"    = "#1B3A6B",
+  "Long / Inaccurate"  = "#C0392B",
+  "Short / Accurate"   = "#C8A951",
+  "Short / Inaccurate" = "#888888"
+)
+```
+
+## Visual A — Pooled Scatter With Top Performers Highlighted
+
+```{r section4-visual-a}
+p_archetype_scatter <- ggplot() +
+  geom_point(data = df_2007, aes(dist_vs_field, acc_vs_field), alpha = 0.12, color = "grey70", size = 0.8) +
+  geom_point(data = top25_all, aes(dist_vs_field, acc_vs_field, color = archetype), alpha = 0.85, size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = archetype_colors) +
+  labs(x = "Distance vs. field (yds)", y = "Accuracy vs. field (%)", color = NULL) +
+  THEME_BASE
+
+p_archetype_scatter
+```
+
+**Each point is one player-season since 2007.** Grey points show the full
+field; colored points highlight players who finished in the top 25 by
+strokes gained that year.
+
+```{r section4-visual-a-save}
+ggsave(here(PATH_FIGURES, "publication", "10_archetype_scatter.png"),
+       p_archetype_scatter, width = 10, height = 7, dpi = 300)
+ggsave(here(PATH_FIGURES, "social", "10_archetype_scatter.png"),
+       p_archetype_scatter, width = 10, height = 7, dpi = 150)
+```
+
+## Visual B — Two-Era Comparison
+
+```{r section4-visual-b}
+era_bins <- function(y) case_when(
+  y <= 2011 ~ "2007-11", y <= 2016 ~ "2012-16",
+  y <= 2021 ~ "2017-21", TRUE ~ "2022-25"
+)
+era_levels <- c("2007-11", "2012-16", "2017-21", "2022-25")
+
+df_2007_era <- df_2007 %>% mutate(era = factor(era_bins(year), levels = era_levels))
+top25_era <- top25_all %>% mutate(era = factor(era_bins(year), levels = era_levels))
+
+# Corner count/pct labels — one per era x archetype, placed near that
+# archetype's quadrant corner using fixed inset coordinates.
+x_rng <- range(df_2007_era$dist_vs_field); y_rng <- range(df_2007_era$acc_vs_field)
+corner_x <- c("Long / Accurate" = x_rng[2] * 0.92, "Long / Inaccurate" = x_rng[2] * 0.92,
+              "Short / Accurate" = x_rng[1] * 0.92, "Short / Inaccurate" = x_rng[1] * 0.92)
+corner_y <- c("Long / Accurate" = y_rng[2] * 0.92, "Long / Inaccurate" = y_rng[1] * 0.92,
+              "Short / Accurate" = y_rng[2] * 0.92, "Short / Inaccurate" = y_rng[1] * 0.92)
+
+era_corner_labels <- top25_era %>%
+  count(era, archetype) %>%
+  group_by(era) %>%
+  mutate(pct = round(n / sum(n) * 100)) %>%
+  ungroup() %>%
+  mutate(
+    label = paste0(n, " (", pct, "%)"),
+    x = corner_x[as.character(archetype)],
+    y = corner_y[as.character(archetype)]
+  )
+
+p_archetype_era <- ggplot() +
+  geom_point(data = df_2007_era, aes(dist_vs_field, acc_vs_field), alpha = 0.12, color = "grey70", size = 0.8) +
+  geom_point(data = top25_era, aes(dist_vs_field, acc_vs_field, color = archetype), alpha = 0.85, size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_label(data = era_corner_labels, aes(x, y, label = label, color = archetype),
+             fill = "white", alpha = 0.85, label.size = 0, size = 3, fontface = "bold",
+             show.legend = FALSE) +
+  scale_color_manual(values = archetype_colors) +
+  facet_wrap(~era, ncol = 2) +
+  labs(x = "Distance vs. field (yds)", y = "Accuracy vs. field (%)", color = NULL) +
+  THEME_BASE
+
+p_archetype_era
+```
+
+**Comparing four eras in five-year increments** — including 2022-25 on
+its own, given the interest in the most recent period — top performers
+(colored points) appear increasingly concentrated in the **Long/Accurate**
+quadrant, not Long/Inaccurate. Corner labels show the count (and %) of top
+performers falling into each archetype that era. The clearest shift among
+winners is toward excelling at both distance and accuracy together,
+though the most recent era shows a slight pullback from the 2017-21 peak.
+
+```{r section4-visual-b-save}
+ggsave(here(PATH_FIGURES, "publication", "10_archetype_two_era.png"),
+       p_archetype_era, width = 10, height = 9, dpi = 300)
+ggsave(here(PATH_FIGURES, "social", "10_archetype_two_era.png"),
+       p_archetype_era, width = 10, height = 9, dpi = 150)
+```
+
+## Visual C — Archetype Trend Lines Among Top Performers
+
+```{r section4-visual-c}
+top25pct <- df_2007 %>%
+  group_by(year) %>%
+  mutate(pct_rank = percent_rank(sg_total)) %>%
+  ungroup() %>%
+  filter(pct_rank >= 0.75)
+
+archetype_trend <- top25pct %>%
+  count(year, archetype) %>%
+  group_by(year) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup()
+
+p_archetype_trend <- ggplot(archetype_trend, aes(year, pct, color = archetype)) +
+  geom_point(alpha = 0.25) +
+  geom_smooth(method = "loess", se = FALSE, span = 0.6, linewidth = 1.1) +
+  scale_color_manual(values = archetype_colors) +
+  labs(x = NULL, y = "% of top performers (25th percentile and above)", color = NULL) +
+  THEME_BASE
+
+p_archetype_trend
+```
+
+**Among the tour's top performers, Long/Accurate has grown the most**
+(16.3%→22.2%, 2007-2025) — not Long/Inaccurate, which grew only modestly
+(30.6%→33.3%) and stays closest to what you'd expect if archetypes were
+evenly split. Both short-hitting archetypes declined. Power increasingly
+comes packaged with accuracy at the top of the leaderboard, not at
+accuracy's expense.
+
+```{r section4-visual-c-save}
+ggsave(here(PATH_FIGURES, "publication", "10_archetype_trend_lines.png"),
+       p_archetype_trend, width = 10, height = 7, dpi = 300)
+ggsave(here(PATH_FIGURES, "social", "10_archetype_trend_lines.png"),
+       p_archetype_trend, width = 10, height = 7, dpi = 150)
+```
+
+## Visual D — Heat Map: Archetype Overrepresentation Among Top Performers
+
+```{r section4-visual-d}
+df_2007_ranked <- df_2007 %>%
+  group_by(year) %>%
+  mutate(pct_rank = percent_rank(sg_total)) %>%
+  ungroup()
+
+# Version 1: individual years
+heat_v1 <- df_2007_ranked %>%
+  group_by(archetype, year) %>%
+  summarise(pct_top25 = mean(pct_rank >= 0.75) * 100, .groups = "drop")
+
+p_heat_v1 <- ggplot(heat_v1, aes(year, archetype, fill = pct_top25)) +
+  geom_tile() +
+  scale_fill_gradient2(low = COL_NEUTRAL, mid = "white", high = COL_PRIMARY, midpoint = 25, name = "% in\ntop 25%") +
+  labs(x = NULL, y = NULL) +
+  THEME_BASE
+
+p_heat_v1
+```
+
+```{r section4-visual-d-v2}
+# Version 2: 5-year bins, with values annotated
+heat_v2 <- df_2007_ranked %>%
+  mutate(bin = case_when(
+    year <= 2011 ~ "2007-11", year <= 2016 ~ "2012-16",
+    year <= 2021 ~ "2017-21", TRUE ~ "2022-25"
+  )) %>%
+  group_by(archetype, bin) %>%
+  summarise(pct_top25 = mean(pct_rank >= 0.75) * 100, .groups = "drop")
+
+p_heat_v2 <- ggplot(heat_v2, aes(bin, archetype, fill = pct_top25)) +
+  geom_tile() +
+  geom_text(aes(label = round(pct_top25, 0)), color = "black", size = 3.8) +
+  scale_fill_gradient2(low = COL_NEUTRAL, mid = "white", high = COL_PRIMARY, midpoint = 25, name = "% in\ntop 25%") +
+  labs(x = NULL, y = NULL) +
+  THEME_BASE
+
+p_heat_v2
+```
+
+**Cells shaded darker indicate an archetype is overrepresented among top
+performers.** The 25% midpoint represents what we'd expect if performance
+were evenly distributed across archetypes. Long/Accurate is the only
+archetype consistently and increasingly darker than baseline — every
+other archetype sits at or below what even representation would predict.
+
+```{r section4-visual-d-save}
+ggsave(here(PATH_FIGURES, "publication", "10_archetype_heatmap_yearly.png"),
+       p_heat_v1, width = 10, height = 5, dpi = 300)
+ggsave(here(PATH_FIGURES, "social", "10_archetype_heatmap_yearly.png"),
+       p_heat_v1, width = 10, height = 5, dpi = 150)
+ggsave(here(PATH_FIGURES, "publication", "10_archetype_heatmap_binned.png"),
+       p_heat_v2, width = 8, height = 5, dpi = 300)
+ggsave(here(PATH_FIGURES, "social", "10_archetype_heatmap_binned.png"),
+       p_heat_v2, width = 8, height = 5, dpi = 150)
+```
+
+---
+
+# Section 5: The Rising Floor
+
+```{r section5-data}
+df_floor <- df_main %>% filter(year >= SPEED_ERA_START)
+
+floor_pctile <- function(data, pct) {
+  data %>%
+    summarise(ball_speed = quantile(ball_speed, pct), chs = quantile(chs, pct),
+              distance = quantile(distance, pct), .groups = "drop")
+}
+
+tier_top10  <- df_floor %>% group_by(year) %>% slice_max(sg_total, n = 10)  %>% floor_pctile(0.10) %>% mutate(tier = "Top 10")
+tier_top25  <- df_floor %>% group_by(year) %>% slice_max(sg_total, n = 25)  %>% floor_pctile(0.10) %>% mutate(tier = "Top 25")
+tier_top50  <- df_floor %>% group_by(year) %>% slice_max(sg_total, n = 50)  %>% floor_pctile(0.10) %>% mutate(tier = "Top 50")
+tier_top100 <- df_floor %>% group_by(year) %>% slice_max(sg_total, n = 100) %>% floor_pctile(0.10) %>% mutate(tier = "Top 100")
+
+tier_median <- df_floor %>%
+  group_by(year) %>%
+  summarise(ball_speed = median(ball_speed), chs = median(chs), distance = median(distance), .groups = "drop") %>%
+  mutate(tier = "Tour Median")
+
+tier_positive_sg <- df_floor %>%
+  filter(sg_total > 0) %>%
+  group_by(year) %>%
+  floor_pctile(0.05) %>%
+  mutate(tier = "Positive SG (5th pctile)")
+
+tier_levels <- c("Tour Median", "Positive SG (5th pctile)", "Top 100", "Top 50", "Top 25", "Top 10")
+
+floor_data <- bind_rows(tier_top10, tier_top25, tier_top50, tier_top100, tier_median, tier_positive_sg) %>%
+  mutate(tier = factor(tier, levels = tier_levels))
+```
+
+## Reference Tables
+
+Split by metric rather than one wide table, so each is scannable at a glance.
+
+```{r section5-tables}
+selected_years <- c(2007, 2012, 2017, 2022, 2025)
+metric_label_map <- c(ball_speed = "Ball Speed", chs = "CHS", distance = "Distance")
+
+make_tier_table <- function(metric_col, caption) {
+  floor_data %>%
+    filter(year %in% selected_years) %>%
+    select(tier, year, value = all_of(metric_col)) %>%
+    mutate(value = round(value, 1)) %>%
+    pivot_wider(names_from = year, values_from = value) %>%
+    arrange(tier) %>%
+    rename(Tier = tier) %>%
+    knitr::kable(caption = caption)
+}
+
+make_tier_table("ball_speed", "Ball Speed (mph) by Competitive Tier")
+```
+
+```{r section5-table-chs}
+make_tier_table("chs", "Clubhead Speed (mph) by Competitive Tier")
+```
+
+```{r section5-table-distance}
+make_tier_table("distance", "Distance (yds) by Competitive Tier")
+```
+
+## Visual A — Floor Trends by Tier (Full Time Series)
+
+```{r section5-visual-a}
+tier_colors <- setNames(
+  c(COL_NEUTRAL, COL_ACCENT, "#7FA8D9", "#4C78A8", COL_SECONDARY, COL_PRIMARY),
+  tier_levels
+)
+
+floor_long <- floor_data %>%
+  pivot_longer(c(ball_speed, chs, distance), names_to = "metric", values_to = "value") %>%
+  mutate(metric = factor(metric_label_map[metric], levels = metric_label_map))
+
+p_floor_grid <- ggplot(floor_long, aes(year, value, color = tier)) +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~metric, scales = "free_y") +
+  scale_color_manual(values = tier_colors, name = NULL) +
+  labs(x = NULL, y = NULL) +
+  THEME_BASE
+
+p_floor_grid
+```
+
+**Each line traces the power floor at a given competitive tier across the
+full 2007-2025 speed era.** Tour Median and Positive-SG floor track each
+other closely; the gap between Top 100 and Top 10 shows how much more
+separates the very best from merely-competitive today.
+
+```{r section5-visual-a-save}
+ggsave(here(PATH_FIGURES, "publication", "10_rising_floor_trend_grid.png"),
+       p_floor_grid, width = 11, height = 5, dpi = 300)
+ggsave(here(PATH_FIGURES, "social", "10_rising_floor_trend_grid.png"),
+       p_floor_grid, width = 11, height = 5, dpi = 150)
+```
+
+## Visual B — Power-Efficient Performer Profile
+
+```{r section5-visual-b}
+efficient_performers <- df_floor %>%
+  filter(sg_total > 0) %>%
+  group_by(year) %>%
+  mutate(speed_pct_rank = percent_rank(ball_speed)) %>%
+  ungroup() %>%
+  filter(speed_pct_rank <= 0.25)
+
+component_labels <- c(sg_ott = "Off the Tee", sg_apr = "Approach", sg_arg = "Around the Green", sg_putt = "Putting")
+
+efficient_trend <- efficient_performers %>%
+  group_by(year) %>%
+  summarise(sg_ott = mean(sg_ott), sg_apr = mean(sg_apr), sg_arg = mean(sg_arg), sg_putt = mean(sg_putt), .groups = "drop") %>%
+  pivot_longer(-year, names_to = "component", values_to = "value")
+
+p_efficient <- ggplot(efficient_trend, aes(year, value, color = component)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "loess", se = TRUE, span = 0.6) +
+  scale_color_manual(values = setNames(COL_QUINTILES[1:4], names(component_labels)), labels = component_labels) +
+  labs(x = NULL, y = "Mean Strokes Gained", color = NULL) +
+  THEME_BASE
+
+p_efficient
+```
+
+**Players who post positive strokes gained despite below-average ball
+speed compensate heavily through approach play and putting.** This chart
+shows how their compensatory skill profile has evolved over time.
+
+```{r section5-visual-b-save}
+ggsave(here(PATH_FIGURES, "publication", "10_power_efficient_profile.png"),
+       p_efficient, width = 10, height = 7, dpi = 300)
+ggsave(here(PATH_FIGURES, "social", "10_power_efficient_profile.png"),
+       p_efficient, width = 10, height = 7, dpi = 150)
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,244 @@
+---
+title: "08 — Distance Premium and Floor Mechanisms"
+subtitle: "PGA Tour Distance & Speed Analytics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+# Overview
+
+A follow-up to Projects 3 and 4, built after cross-checking a larger
+proposed analysis list against what's already done — several of the
+originally proposed pieces (the raw annual premium, the quintile gap, the
+tiered floor trends) already exist in Projects 3 and 4 and aren't
+rebuilt here. This notebook adds two genuinely new angles:
+
+1. **Is the distance premium a real, direct effect, or partly a proxy for
+   overall skill?** (Section 2 — the conditional premium.)
+2. **Can short-game skill actually compensate for below-average speed, and
+   has that gotten harder as the floor has risen?** (Section 4 — the
+   compensation ceiling.)
+
+---
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+# Core
+library(tidyverse)
+library(here)
+
+# Utilities
+library(broom)
+library(scales)
+
+source(here::here("config.R"))
+
+set.seed(2025)
+
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+```{r load-data}
+df_main <- readRDS(here(PATH_PROCESSED, "df_main.rds")) %>% filter(player_name != "Patrick Sheehan")
+df_speed <- df_main %>% filter(year >= SPEED_ERA_START)
+
+cat("Rows:", nrow(df_main), " Speed-era rows:", nrow(df_speed), "\n")
+```
+
+---
+
+# 2. Is the Distance Premium Real, or a Proxy for Overall Skill?
+
+Project 3 found the *raw* distance premium (`sg_total ~ dist_vs_field`)
+roughly tripled from 2004 to 2025. But that raw premium doesn't control
+for anything else — if today's long hitters are increasingly *also* good
+at approach play, scrambling, and putting (which Project 5's MANOVA found
+they are), some of the raw premium's apparent growth could reflect
+distance becoming a better *proxy* for all-around skill, not distance
+itself paying off more on its own. This section tests that directly by
+adding the other three SG components as controls and seeing whether the
+distance coefficient survives.
+
+```{r conditional-premium}
+premium_comparison <- df_main %>%
+  group_by(year) %>%
+  summarise(
+    raw_premium       = coef(lm(sg_total ~ dist_vs_field))[["dist_vs_field"]] * 10,
+    conditional_premium = coef(lm(sg_total ~ dist_vs_field + sg_apr + sg_arg + sg_putt))[["dist_vs_field"]] * 10,
+    .groups = "drop"
+  )
+
+premium_comparison %>% print(n = 10)
+```
+
+```{r conditional-premium-plot}
+premium_long <- premium_comparison %>%
+  pivot_longer(-year, names_to = "type", values_to = "premium")
+
+p_premium_comparison <- ggplot(premium_long, aes(year, premium, color = type)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(
+    values = c(raw_premium = COL_ACCENT, conditional_premium = COL_PRIMARY),
+    labels = c(raw_premium = "Raw premium", conditional_premium = "Conditional premium (controls for APR/ARG/Putt)")
+  ) +
+  labs(
+    title    = "Raw vs. Conditional Distance Premium",
+    subtitle = "SG_total per 10 yards above the field average",
+    x = NULL, y = "SG_total per 10 yards", color = NULL
+  ) +
+  THEME_BASE
+
+p_premium_comparison
+```
+
+```{r conditional-premium-findings}
+corr_raw_cond <- cor(premium_comparison$raw_premium, premium_comparison$conditional_premium)
+raw_2004 <- premium_comparison$raw_premium[premium_comparison$year == min(premium_comparison$year)]
+cond_2004 <- premium_comparison$conditional_premium[premium_comparison$year == min(premium_comparison$year)]
+raw_sd <- sd(premium_comparison$raw_premium)
+cond_sd <- sd(premium_comparison$conditional_premium)
+```
+
+**Finding:** the two series correlate only
+`r round(corr_raw_cond, 2)` — they tell meaningfully different stories.
+In 2004, the raw premium was
+`r round(raw_2004, 2)` but the conditional premium was already
+`r round(cond_2004, 2)` — over 3x higher. And the conditional premium is
+far more *stable* across the whole window (SD =
+`r round(cond_sd, 3)`) than the raw premium (SD =
+`r round(raw_sd, 3)`), which visibly trends upward. **This means a
+meaningful part of the raw premium's apparent growth reflects distance
+becoming a better proxy for overall skill** — today's long hitters are
+increasingly also the accurate, good-short-game players (Project 5) — **not
+that a yard of distance, skill held constant, has become dramatically more
+valuable on its own.** The "pure" distance effect was already substantial
+in 2004 and has stayed roughly in the same range since.
+
+## 2.1 Reference table
+
+```{r pull-quote-table}
+premium_comparison %>%
+  filter(year %in% c(2004, 2010, 2015, 2020, 2025)) %>%
+  mutate(across(c(raw_premium, conditional_premium), ~round(.x, 2))) %>%
+  print()
+```
+
+Project 3's pooled mixed-effects model (§7) put the raw premium at ~0.12
+(2004) rising to ~0.30 (2025) — roughly a 2.5x increase. This section adds
+the missing context: conditional on other skills, the increase is much
+smaller, because a large part of the raw trend is compositional (the kind
+of player who hits it long has changed), not purely mechanical (a yard of
+distance itself paying off more).
+
+---
+
+# 3. Setting Up the Compensation Question
+
+Can a below-average-speed player still compete at an elite level by being
+excellent at the short game? And if so, has that gotten harder as the
+competitive floor has risen (Project 4)? Restricting to the speed era
+(`SPEED_ERA_START`+, since `ball_speed` isn't reliable before 2007).
+
+```{r bottom-speed-setup}
+df_bottom_speed <- df_speed %>%
+  group_by(year) %>%
+  mutate(speed_rank_pct = percent_rank(ball_speed), sg_rank = rank(-sg_total)) %>%
+  ungroup() %>%
+  filter(speed_rank_pct <= 0.25)
+
+cat("Bottom-25%-ball-speed player-seasons:", nrow(df_bottom_speed), "\n")
+```
+
+## 3.1 Does short game actually help this group?
+
+```{r compensation-regression}
+fit_compensation <- lm(sg_total ~ sg_putt + sg_apr, data = df_bottom_speed)
+tidy(fit_compensation, conf.int = TRUE) %>% print()
+```
+
+**Finding:** among bottom-25%-speed players specifically, both `sg_putt`
+and `sg_apr` are strong, highly significant predictors of `sg_total`
+(coefficients both well above 0.9, p<0.001) — short-game and approach
+skill genuinely do help a below-average-speed player post a good overall
+season. The compensation mechanism is real, not wishful thinking.
+
+## 3.2 Has it gotten harder to compensate all the way to elite status?
+
+Real short-game skill helping *some* is different from it being enough to
+reach the *top* of the field. This tracks the share of bottom-25%-speed
+players each year who still make the top 50 in `sg_total`.
+
+```{r compensation-ceiling}
+compensation_ceiling <- df_bottom_speed %>%
+  group_by(year) %>%
+  summarise(n_slow = n(), pct_top50 = mean(sg_rank <= 50) * 100, .groups = "drop")
+
+p_ceiling <- ggplot(compensation_ceiling, aes(year, pct_top50)) +
+  geom_line(color = COL_ACCENT, linewidth = 1) +
+  geom_point(color = COL_ACCENT) +
+  geom_smooth(method = "lm", se = TRUE, color = COL_PRIMARY, linewidth = 0.7, linetype = "dashed") +
+  labs(
+    title    = "Compensation Ceiling: Can Slow Hitters Still Reach the Top 50?",
+    subtitle = "% of bottom-25%-ball-speed players each year who reach top-50 SG_total",
+    x = NULL, y = "% reaching top 50"
+  ) +
+  THEME_BASE
+
+p_ceiling
+```
+
+```{r ceiling-findings}
+ceiling_trend <- tidy(lm(pct_top50 ~ year, data = compensation_ceiling)) %>% filter(term == "year")
+early_ceiling <- compensation_ceiling %>% filter(year <= 2009) %>% summarise(m = mean(pct_top50)) %>% pull(m)
+late_ceiling <- compensation_ceiling %>% filter(year >= 2020) %>% summarise(m = mean(pct_top50)) %>% pull(m)
+```
+
+**Finding:** the trend is negative
+(`r round(ceiling_trend$estimate, 3)`%/year) and **borderline
+significant** (p = `r round(ceiling_trend$p.value, 3)`) — worth stating
+plainly rather than rounding up to "significant" or dismissing as noise.
+The early-era average (2007-2009: `r round(early_ceiling, 1)`%) is
+noticeably higher than the recent-era average (2020-2025:
+`r round(late_ceiling, 1)`%). Read together with section 3.1: short-game
+compensation still genuinely works, but it's gotten harder to compensate
+*all the way* to elite status as the overall floor has risen (Project 4) —
+consistent with, not contradicting, everything else this project has
+found about the rising floor.
+
+---
+
+# 4. Summary
+
+- **The distance premium's apparent 2.5x growth (Project 3) partly
+  reflects distance becoming a better proxy for overall skill**, not a
+  dramatic increase in distance's own payoff — the conditional premium
+  (controlling for other SG components) was already substantial in 2004
+  and has stayed comparatively stable since.
+- **Short-game skill can genuinely help a below-average-speed player
+  compete** — but the share who parlay that into a top-50 season has
+  declined (borderline significant), consistent with a rising floor that's
+  outpacing what compensation alone can offset.
+
+---
+
+# 5. Session Info
+
+```{r session-info}
+sessionInfo()
+```

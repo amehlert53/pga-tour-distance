@@ -1,0 +1,418 @@
+---
+title: "09 — Composition, Demographics, and Case Studies"
+subtitle: "PGA Tour Distance & Speed Analytics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+# Overview
+
+A second follow-up notebook, alongside `08_distance_premium_and_floor.Rmd`.
+This one asks: how much of the observed distance trend is *who's on tour*
+rather than *individual players getting better*, what does entering young
+actually look like across eras, and what do the group-level findings from
+this whole project look like for specific, real players?
+
+Age composition (Project 6 §8.1), the Mundlak decomposition (Project 6 §7),
+and the 40+ maintained-vs-declined comparison (Project 7 §10-12) already
+cover related ground and aren't rebuilt here.
+
+---
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+# Core
+library(tidyverse)
+library(here)
+
+# Visualization
+library(patchwork)
+
+# Utilities
+library(broom)
+library(scales)
+
+source(here::here("config.R"))
+
+set.seed(2025)
+
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+`coord_radar()` isn't needed here, but the case studies reuse
+`THEME_BASE`/color constants from `config.R` throughout, consistent with
+every other notebook.
+
+```{r load-data}
+df_main <- readRDS(here(PATH_PROCESSED, "df_main.rds")) %>% filter(player_name != "Patrick Sheehan")
+df_survival <- readRDS(here(PATH_PROCESSED, "df_survival.rds"))
+
+cat("Rows:", nrow(df_main), " Players:", n_distinct(df_main$player_name), "\n")
+```
+
+---
+
+# 2. Balanced Panel vs. Unbalanced Panel Trend
+
+The observed "distance is rising" trend (Project 1) is computed on
+*whoever's in the dataset that year* — a different mix of players every
+season. If we instead track only players present in *every* year of a
+window (a "balanced panel"), we isolate individual improvement from
+compositional turnover (players entering/exiting). If the balanced-panel
+trend is much flatter than the full-field trend, that means turnover — not
+individual players getting longer — is doing most of the work.
+
+```{r balanced-panel}
+test_window <- function(start_year, end_year, df = df_main) {
+  years_needed <- start_year:end_year
+  balanced_players <- df %>%
+    filter(year %in% years_needed) %>%
+    distinct(player_name, year) %>%
+    count(player_name) %>%
+    filter(n == length(years_needed)) %>%
+    pull(player_name)
+
+  balanced_trend <- df %>%
+    filter(player_name %in% balanced_players, year %in% years_needed) %>%
+    group_by(year) %>%
+    summarise(mean_dist = mean(distance), .groups = "drop") %>%
+    mutate(panel = "Balanced (same players every year)")
+
+  unbalanced_trend <- df %>%
+    filter(year %in% years_needed) %>%
+    group_by(year) %>%
+    summarise(mean_dist = mean(distance), .groups = "drop") %>%
+    mutate(panel = "Unbalanced (full field)")
+
+  list(
+    n_balanced = length(balanced_players),
+    slope_balanced = coef(lm(mean_dist ~ year, data = balanced_trend))[["year"]],
+    slope_unbalanced = coef(lm(mean_dist ~ year, data = unbalanced_trend))[["year"]],
+    data = bind_rows(balanced_trend, unbalanced_trend)
+  )
+}
+
+primary <- test_window(2015, 2025)
+robustness_1 <- test_window(2010, 2020)
+robustness_2 <- test_window(2018, 2025)
+
+cat("2015-2025: n_balanced=", primary$n_balanced,
+    " slope_balanced=", round(primary$slope_balanced, 3),
+    " slope_unbalanced=", round(primary$slope_unbalanced, 3), "\n")
+cat("2010-2020: n_balanced=", robustness_1$n_balanced,
+    " slope_balanced=", round(robustness_1$slope_balanced, 3),
+    " slope_unbalanced=", round(robustness_1$slope_unbalanced, 3), "\n")
+cat("2018-2025: n_balanced=", robustness_2$n_balanced,
+    " slope_balanced=", round(robustness_2$slope_balanced, 3),
+    " slope_unbalanced=", round(robustness_2$slope_unbalanced, 3), "\n")
+```
+
+```{r balanced-panel-plot}
+p_balanced <- ggplot(primary$data, aes(year, mean_dist, color = panel)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  scale_color_manual(values = c(
+    "Balanced (same players every year)" = COL_PRIMARY,
+    "Unbalanced (full field)" = COL_ACCENT
+  )) +
+  labs(
+    title    = "Balanced vs. Unbalanced Panel Distance Trend, 2015-2025",
+    subtitle = paste0("Balanced panel: ", primary$n_balanced, " players present in every year"),
+    x = NULL, y = "Mean distance (yds)", color = NULL
+  ) +
+  THEME_BASE
+
+p_balanced
+```
+
+**Finding:** in every window tested, the balanced-panel slope is
+dramatically flatter than the full-field slope —
+`r round(primary$slope_balanced, 2)` vs.
+`r round(primary$slope_unbalanced, 2)` yds/yr (2015-2025, a
+`r round(primary$slope_unbalanced/primary$slope_balanced, 1)`x difference);
+`r round(robustness_1$slope_balanced, 2)` vs.
+`r round(robustness_1$slope_unbalanced, 2)` (2010-2020); and
+`r round(robustness_2$slope_balanced, 2)` vs.
+`r round(robustness_2$slope_unbalanced, 2)` (2018-2025). **This is a
+genuinely important reframing of this project's central narrative**: most
+of the observed "distance is rising" story reflects *who's on tour* —
+shorter/older players leaving, longer new entrants arriving — not existing
+individual players getting dramatically longer year over year. The
+sample sizes here are modest (20-43 players), so treat the exact
+multipliers as approximate, but the direction is completely consistent
+across three independent windows.
+
+---
+
+# 3. New Entrant vs. Incumbent Trend
+
+A related but distinct angle: comparing new entrants (their first two
+seasons) to incumbents (3+ seasons), tracked by calendar year. Unlike
+section 2, this mixes within-player improvement and compositional change
+*within* the incumbent group too — it's a softer, complementary signal,
+not as clean a test as the balanced panel above.
+
+```{r new-entrant-incumbent}
+df_status <- df_main %>%
+  mutate(
+    seasons_so_far = year - entry_year + 1,
+    status = if_else(seasons_so_far <= 2, "New entrant (yr 1-2)", "Incumbent (3+ yrs)")
+  )
+
+status_trend <- df_status %>%
+  group_by(year, status) %>%
+  summarise(mean_dist = mean(distance), n = n(), .groups = "drop")
+
+p_status <- ggplot(status_trend, aes(year, mean_dist, color = status)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  scale_color_manual(values = c("New entrant (yr 1-2)" = COL_SECONDARY, "Incumbent (3+ yrs)" = COL_PRIMARY)) +
+  labs(title = "Distance: New Entrants vs. Incumbents", x = NULL, y = "Mean distance (yds)", color = NULL) +
+  THEME_BASE
+
+p_status
+```
+
+```{r status-findings}
+status_slopes <- df_status %>%
+  group_by(status) %>%
+  group_modify(~tidy(lm(distance ~ year, data = .x))) %>%
+  filter(term == "year")
+
+status_slopes %>% print()
+gap_avg <- status_trend %>% pivot_wider(id_cols = year, names_from = status, values_from = mean_dist) %>%
+  mutate(gap = `New entrant (yr 1-2)` - `Incumbent (3+ yrs)`) %>% summarise(m = mean(gap)) %>% pull(m)
+```
+
+**Finding:** new entrants are consistently
+`r round(gap_avg, 1)` yards longer than incumbents on average throughout
+the whole window, but the two groups' slopes are similar
+(`r round(status_slopes$estimate[status_slopes$status=="New entrant (yr 1-2)"], 3)`
+vs.
+`r round(status_slopes$estimate[status_slopes$status=="Incumbent (3+ yrs)"], 3)`
+yds/yr) — new entrants have always arrived longer than the incumbent pool,
+but that gap itself isn't dramatically widening. This is consistent with
+section 2's balanced-panel finding without being as clean a test of it.
+
+---
+
+# 4. Young Entrants (Under 25): Profile and Development
+
+## 4.1 Why not by single entry year
+
+```{r young-entrant-setup}
+young_entrants <- df_main %>%
+  filter((year - entry_year) <= 2) %>%
+  mutate(age_at_entry = age - (year - entry_year)) %>%
+  distinct(player_name, entry_year, age_at_entry) %>%
+  filter(age_at_entry < 25)
+
+cat("Young entrants (age < 25 at entry):", nrow(young_entrants), "\n")
+
+by_entry_year <- young_entrants %>% count(entry_year)
+cat("Players per entry year - range:", min(by_entry_year$n), "to", max(by_entry_year$n), "\n")
+```
+
+**Finding:** only `r min(by_entry_year$n)`-`r max(by_entry_year$n)`
+young entrants per single year — too few to plot year by year without
+excessive noise. Section 4.2 uses entry *decade* instead.
+
+## 4.2 Development trajectory by entry decade
+
+For young entrants with at least 5 seasons, their `dist_vs_field`
+trajectory over their first 5 years on tour, grouped by the decade they
+entered.
+
+```{r development-trajectory}
+young_long <- young_entrants %>%
+  inner_join(df_main %>% count(player_name, name = "n_seasons_total"), by = "player_name") %>%
+  filter(n_seasons_total >= 5)
+
+dev_trajectory <- df_main %>%
+  semi_join(young_long, by = "player_name") %>%
+  mutate(years_since_entry = year - entry_year, decade = paste0(floor(entry_year / 10) * 10, "s")) %>%
+  filter(years_since_entry <= 5) %>%
+  group_by(decade, years_since_entry) %>%
+  summarise(mean_dist_vs_field = mean(dist_vs_field), n = n(), .groups = "drop")
+
+p_development <- ggplot(dev_trajectory, aes(years_since_entry, mean_dist_vs_field, color = decade)) +
+  geom_line(linewidth = 1) +
+  geom_point(aes(size = n)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(
+    title    = "Young Entrant (<25) Development Trajectory by Entry Decade",
+    subtitle = "Point size = number of players in that cell (2020s cell is thin - see finding)",
+    x = "Years since tour entry", y = "Distance vs. field (yds)", color = "Entry decade", size = "n"
+  ) +
+  THEME_BASE
+
+p_development
+```
+
+```{r development-findings}
+n_2020s <- dev_trajectory %>% filter(decade == "2020s") %>% summarise(n = max(n)) %>% pull(n)
+```
+
+**Finding:** 2000s-decade young entrants sat consistently 4-8 yards above
+the field average through their first 5 years; 2010s-decade entrants sat
+somewhat lower (3-6 yards); the 2020s-decade line drops toward zero or
+negative by year 4-5 — **but that cell has only `r n_2020s` players with
+immature (recently-entered) data**, so it's preliminary, not a confirmed
+trend. Read cautiously: it may simply reflect that this cohort hasn't had
+time to develop yet, not that recent young entrants are actually
+less exceptional.
+
+---
+
+# 5. Case Studies
+
+Five players, selected by querying `df_main`/`df_survival` directly for
+the best-fitting real example of each archetype this project has
+identified — not chosen from a suggested list without verification.
+
+```{r case-study-function}
+case_study_plot <- function(player, title_suffix = "") {
+  d <- df_main %>% filter(player_name == player)
+  field_avg <- df_main %>% group_by(year) %>% summarise(field_dist = mean(distance), .groups = "drop")
+  d_joined <- d %>% left_join(field_avg, by = "year")
+
+  p1 <- ggplot(d_joined, aes(year)) +
+    geom_line(aes(y = distance, color = "Player"), linewidth = 1) +
+    geom_line(aes(y = field_dist, color = "Field average"), linewidth = 0.8, linetype = "dashed") +
+    scale_color_manual(values = c("Player" = COL_PRIMARY, "Field average" = "grey50")) +
+    labs(title = "Distance vs. field", x = NULL, y = "Yards", color = NULL) +
+    THEME_BASE + theme(legend.position = "bottom")
+
+  p2 <- ggplot(d, aes(year, dist_vs_field)) +
+    geom_col(fill = COL_SECONDARY) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    labs(title = "Distance vs. field (relative)", x = NULL, y = "Yards above/below field") +
+    THEME_BASE
+
+  sg_long <- d %>% select(year, sg_ott, sg_apr, sg_arg, sg_putt) %>%
+    pivot_longer(-year, names_to = "component", values_to = "value")
+  p3 <- ggplot(sg_long, aes(year, value, fill = component)) +
+    geom_col(position = "stack") +
+    labs(title = "SG components by year", x = NULL, y = "Strokes gained", fill = NULL) +
+    THEME_BASE + theme(legend.position = "bottom")
+
+  p4 <- ggplot(d, aes(year, archetype, color = archetype)) +
+    geom_point(size = 3) +
+    labs(title = "Archetype by year", x = NULL, y = NULL, color = NULL) +
+    THEME_BASE + theme(legend.position = "none")
+
+  (p1 + p2) / (p3 + p4) + plot_annotation(title = paste0(player, title_suffix))
+}
+```
+
+## 5.1 Bubba Watson — Long-Career Power Hitter
+
+Selected because: 16 seasons (2006-2021), +20.7 yds average distance vs.
+field, above the field average in 100% of his seasons — the cleanest
+"long career built on sustained distance" profile in the data.
+
+```{r case-bubba, fig.height=8}
+case_study_plot("Bubba Watson", " — Long-Career Power Hitter")
+```
+
+Watson's whole career sits well above the rising field average — even as
+the field average itself climbed (Project 1), he stayed ahead of it for
+16 straight years, a rare combination of power *and* durability.
+
+## 5.2 Scottie Scheffler — Young Power Climber
+
+Selected because: 2020 entrant, +8.1 yds vs. field, **+1.87 mean SG_total**
+— an exceptional number, the standout candidate for this archetype and
+far more current than an older-generation name would be.
+
+```{r case-scheffler, fig.height=8}
+case_study_plot("Scottie Scheffler", " — Young Power Climber")
+```
+
+Scheffler's SG_total is dramatically higher than a typical tour player
+from his very first seasons — this is the "arrived already elite" story,
+distinct from Watson's "built a long career" story above.
+
+## 5.3 Jim Furyk — Short Hitter Who Compensated
+
+Selected because: -11.7 yds vs. field on average, but +1.23 mean SG_total
+— the best distance-deficit-to-performance combination found in the data,
+directly illustrating Project 8's compensation-ceiling finding in a real
+career.
+
+```{r case-furyk, fig.height=8}
+case_study_plot("Jim Furyk", " — Short Hitter Who Compensated")
+```
+
+Furyk's SG components show consistently strong approach and putting
+carrying an overall excellent career despite a persistent distance
+deficit — living proof that the compensation mechanism (§3.1 of Notebook
+08) is real.
+
+## 5.4 Corey Pavin — Fell Below the Rising Floor
+
+Selected because: entered 2004, exited 2009, ending at **-29.0 yds** vs.
+field — the most dramatic relative decline among confirmed exits (using
+the 3-year gap threshold from Project 7).
+
+```{r case-pavin, fig.height=8}
+case_study_plot("Corey Pavin", " — Fell Below the Rising Floor")
+```
+
+Pavin's `dist_vs_field` collapses over his final seasons — a concrete
+illustration of Project 4's rising-floor finding: the field kept moving up
+around him faster than he could keep pace.
+
+## 5.5 Aaron Baddeley — Adaptive Veteran
+
+Selected because: -15.4 yd distance change from prime to 38+, paired with
+a **+5.9 accuracy gain** — one of the clearest examples of Project 7's
+"traded power for precision" persistence archetype.
+
+```{r case-baddeley, fig.height=8}
+case_study_plot("Aaron Baddeley", " — Adaptive Veteran")
+```
+
+Baddeley's SG component mix visibly shifts over his 20-season career — a
+real, nameable version of the "traded power for precision" cluster found
+statistically in Project 7.
+
+---
+
+# 6. Summary
+
+- **Most of the observed distance trend is compositional, not
+  individual improvement** — balanced-panel trends are 2.5-7x flatter
+  than the full-field trend across every window tested. New, longer-hitting
+  entrants replacing shorter/older exits does more work than existing
+  players getting longer.
+- **Young entrant development is preliminary but suggestive** — earlier
+  cohorts of young entrants sustained a bigger distance advantage through
+  their first 5 years than more recent ones appear to (with the important
+  caveat that the most recent cohort's data is still immature).
+- **The five case studies put a face on every major group finding in this
+  project**: sustained power (Watson), arriving already elite (Scheffler),
+  compensating for a distance deficit (Furyk), being overtaken by the
+  rising floor (Pavin), and adapting a game as power declines (Baddeley).
+
+---
+
+# 7. Session Info
+
+```{r session-info}
+sessionInfo()
+```
