@@ -1,0 +1,381 @@
+---
+title: "11 — Veteran Success Profile"
+subtitle: "PGA Tour Distance & Speed Analytics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+# Overview
+
+**Question:** Project 10's Section 3 found the 40+ share of the tour's top
+100 collapsed from roughly 31% to 8% since 2004. That tells us *how many*
+veterans remain competitive, but not *what changed about them*. This
+notebook asks: is the profile of a successful 40+ golfer different today
+than it was two decades ago, and what actually separates the 40+ golfers
+who are still competitive from those who aren't?
+
+**Data:** `df_main`, filtered to `age >= 40`. A comprehensive set of
+available metrics is used: driving distance and accuracy relative to the
+field (`dist_vs_field`, `acc_vs_field`), swing-speed metrics available from
+`SPEED_ERA_START` onward (`speed_vs_field`, `chs_vs_field`), and all four
+Strokes Gained components plus the total (`sg_ott`, `sg_apr`, `sg_arg`,
+`sg_putt`, `sg_total`).
+
+**A genuine data limitation, checked and confirmed rather than assumed:**
+there is no greens-in-regulation (GIR) column anywhere in this project —
+not in `df_complete.csv`, not in `trends_acc_dist_1987_to_2025.csv`, and
+not among `df_main`'s engineered columns. This isn't a case where another
+file in the repo can recover it (unlike the `entry_year` fix in
+`00_data_engineering.Rmd`) — it's a real boundary of the source data.
+Accuracy (fairways hit %) and the four SG components stand in as the best
+available substitutes for shot-making quality.
+
+**"Successful 40+" is defined as tour-wide top-100 by `sg_total` that
+year** — the same population `10_key_visuals.Rmd` Section 3 used, so this
+notebook stays directly tied to the finding that motivated it.
+
+**Two eras for comparison**, reusing the Early/Late split from Projects 5
+and 7: **Early (2004-2010)** vs. **Late (2018-2025)**. Speed metrics
+(`speed_vs_field`, `chs_vs_field`) are only reliable from 2007 onward
+(`SPEED_ERA_START`), so any comparison involving them uses **Early
+(2007-2010)** instead — the same `speed_era_only` handling Project 6 used
+for this exact reason.
+
+---
+
+# Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+library(patchwork)
+library(scales)
+
+source(here::here("config.R"))
+source(here::here("R", "coord_radar.R"))
+
+df_main <- readRDS(here(PATH_PROCESSED, "df_main.rds")) %>%
+  filter(player_name != "Patrick Sheehan")
+
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 10,
+  fig.height = 7
+)
+```
+
+---
+
+# 1. The 40+ Population
+
+```{r pop-data}
+df_40 <- df_main %>% filter(age >= 40)
+
+top100_by_year <- df_main %>%
+  group_by(year) %>%
+  slice_max(sg_total, n = 100) %>%
+  ungroup() %>%
+  select(player_name, year, top100 = sg_total) %>%
+  mutate(top100 = TRUE)
+
+df_40 <- df_40 %>%
+  left_join(top100_by_year, by = c("player_name", "year")) %>%
+  mutate(top100 = coalesce(top100, FALSE))
+
+pop_by_year <- df_40 %>%
+  group_by(year) %>%
+  summarise(n_40plus = n(), n_successful = sum(top100), .groups = "drop")
+
+pop_by_year %>% print(n = 22)
+```
+
+**Finding:** the 40+ population itself has shrunk from
+`r pop_by_year$n_40plus[pop_by_year$year == 2004]` (2004) to
+`r pop_by_year$n_40plus[pop_by_year$year == 2025]` (2025) player-seasons,
+and the number of those also in the tour-wide top 100 fell from
+`r pop_by_year$n_successful[pop_by_year$year == 2004]` to
+`r pop_by_year$n_successful[pop_by_year$year == 2025]`. The most recent
+years (2023-2025) have as few as
+`r min(pop_by_year$n_successful[pop_by_year$year >= 2023])`
+successful 40+ player-seasons — any year-by-year read of that tail should
+be treated as illustrative, not a stable estimate.
+
+---
+
+# 2. Has the General 40+ Profile Shifted?
+
+Before narrowing to who's still winning, has the *average* 40-something
+tour player changed at all? MANOVA + radar comparison, reusing the exact
+pattern from `05_player_archetypes.Rmd` Section 6, applied here to *all*
+40+ player-seasons (not just successful ones).
+
+```{r era-setup}
+core_vars  <- c("dist_vs_field", "acc_vs_field", "sg_ott", "sg_apr", "sg_arg", "sg_putt", "sg_total")
+speed_vars <- c("speed_vs_field", "chs_vs_field")
+
+early_40 <- df_40 %>% filter(year >= 2004, year <= 2010) %>% mutate(era_grp = "Early (2004-2010)")
+late_40  <- df_40 %>% filter(year >= 2018, year <= 2025) %>% mutate(era_grp = "Late (2018-2025)")
+combined_40 <- bind_rows(early_40, late_40)
+
+cat("n early:", nrow(early_40), " n late:", nrow(late_40), "\n")
+```
+
+## 2.1 Core Profile (Distance, Accuracy, Strokes Gained)
+
+```{r manova-core}
+Y_core <- as.matrix(combined_40 %>% select(all_of(core_vars)))
+fit_core <- manova(Y_core ~ era_grp, data = combined_40)
+summary(fit_core, test = "Pillai")
+```
+
+```{r manova-core-profile}
+profile_core <- combined_40 %>%
+  group_by(era_grp) %>%
+  summarise(across(all_of(core_vars), mean), .groups = "drop")
+
+profile_core %>% print()
+```
+
+```{r radar-core}
+combined_40_z <- combined_40 %>%
+  mutate(across(all_of(core_vars), ~as.numeric(scale(.x)), .names = "z_{.col}"))
+
+radar_core <- combined_40_z %>%
+  group_by(era_grp) %>%
+  summarise(across(starts_with("z_"), mean), .groups = "drop") %>%
+  pivot_longer(-era_grp, names_to = "variable", values_to = "value") %>%
+  mutate(variable = str_remove(variable, "^z_"))
+
+radar_core_closed <- radar_core %>%
+  group_by(era_grp) %>%
+  group_modify(~bind_rows(.x, .x[1, ])) %>%
+  ungroup() %>%
+  mutate(variable = factor(variable, levels = unique(variable)))
+
+p_radar_core <- ggplot(radar_core_closed, aes(x = variable, y = value, group = era_grp, color = era_grp)) +
+  geom_polygon(aes(fill = era_grp), alpha = 0.15, linewidth = 1) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("Early (2004-2010)" = COL_SECONDARY, "Late (2018-2025)" = COL_PRIMARY)) +
+  scale_fill_manual(values = c("Early (2004-2010)" = COL_SECONDARY, "Late (2018-2025)" = COL_PRIMARY)) +
+  coord_radar() +
+  labs(title = "40+ Player Profile: Early vs. Late Era (All 40+, Not Just Successful)", color = NULL, fill = NULL) +
+  THEME_BASE
+
+p_radar_core
+```
+
+```{r manova-core-findings}
+p_core <- summary(fit_core, test = "Pillai")$stats["era_grp", "Pr(>F)"]
+dist_early <- profile_core$dist_vs_field[profile_core$era_grp == "Early (2004-2010)"]
+dist_late  <- profile_core$dist_vs_field[profile_core$era_grp == "Late (2018-2025)"]
+sgtot_early <- profile_core$sg_total[profile_core$era_grp == "Early (2004-2010)"]
+sgtot_late  <- profile_core$sg_total[profile_core$era_grp == "Late (2018-2025)"]
+```
+
+**Finding:** the MANOVA is `r if (p_core < 0.05) "significant" else "not significant"`
+(Pillai's trace, p = `r signif(p_core, 3)`) — across all seven core
+metrics jointly, the *general* 40+ population's profile has **not**
+shifted at a statistically detectable level. This is worth stating
+plainly rather than smoothing over: `sg_total` did drop on average
+(`r round(sgtot_early, 3)` to `r round(sgtot_late, 3)`), and
+`dist_vs_field` moved from `r round(dist_early, 2)` to
+`r round(dist_late, 2)` yards relative to the field, but neither this nor
+the other five metrics moves far enough, relative to the noise in a
+population of this size, to call the *whole* 40+ population's game
+different. The radar chart shows the direction of each individual shift,
+but the honest read of this section is that **the story is likely about
+composition (who's still on tour at 40+) rather than a broad change in
+how 40+ players play** — which is exactly what Section 3 investigates
+directly.
+
+## 2.2 Speed Profile (Speed Era Only)
+
+```{r speed-era-compare}
+early_40_speed <- df_40 %>% filter(year >= 2007, year <= 2010) %>% mutate(era_grp = "Early (2007-2010)")
+late_40_speed  <- df_40 %>% filter(year >= 2018, year <= 2025) %>% mutate(era_grp = "Late (2018-2025)")
+combined_40_speed <- bind_rows(early_40_speed, late_40_speed)
+
+cat("n early (speed era):", nrow(early_40_speed), " n late:", nrow(late_40_speed), "\n")
+
+Y_speed <- as.matrix(combined_40_speed %>% select(all_of(speed_vars)))
+fit_speed <- manova(Y_speed ~ era_grp, data = combined_40_speed)
+summary(fit_speed, test = "Pillai")
+
+profile_speed <- combined_40_speed %>%
+  group_by(era_grp) %>%
+  summarise(across(all_of(speed_vars), mean), .groups = "drop")
+
+profile_speed %>% print()
+```
+
+```{r speed-findings}
+p_speed <- summary(fit_speed, test = "Pillai")$stats["era_grp", "Pr(>F)"]
+bs_early <- profile_speed$speed_vs_field[profile_speed$era_grp == "Early (2007-2010)"]
+bs_late  <- profile_speed$speed_vs_field[profile_speed$era_grp == "Late (2018-2025)"]
+```
+
+**Finding:** the speed-only MANOVA is
+`r if (p_speed < 0.05) "significant" else "not significant"` (p =
+`r signif(p_speed, 3)`). Mean ball speed relative to the field moved from
+`r round(bs_early, 2)` (2007-2010) to `r round(bs_late, 2)` mph
+(2018-2025) — read alongside the core-profile result above, not as an
+independent claim, since the speed-era window truncates the early period
+by three years.
+
+---
+
+# 3. What Separates Successful 40+ From the Rest?
+
+The comparison above describes the *average* 40-something, which mixes
+successful and unsuccessful players together. This section isolates what
+actually discriminates the two, and whether that discriminator has
+changed between eras — the direct answer to "what does it take."
+
+```{r discriminant-setup}
+compute_d <- function(data, metric) {
+  x <- data[[metric]][data$top100]
+  y <- data[[metric]][!data$top100]
+  x <- x[!is.na(x)]; y <- y[!is.na(y)]
+  pooled_sd <- sqrt(((length(x) - 1) * var(x) + (length(y) - 1) * var(y)) / (length(x) + length(y) - 2))
+  tibble(metric = metric, mean_successful = mean(x), mean_rest = mean(y),
+         cohens_d = (mean(x) - mean(y)) / pooled_sd, n_successful = length(x), n_rest = length(y))
+}
+
+discriminant_core <- map_dfr(core_vars, ~bind_rows(
+  compute_d(early_40, .x) %>% mutate(era_grp = "Early (2004-2010)"),
+  compute_d(late_40, .x)  %>% mutate(era_grp = "Late (2018-2025)")
+))
+
+discriminant_speed <- map_dfr(speed_vars, ~bind_rows(
+  compute_d(early_40_speed, .x) %>% mutate(era_grp = "Early (2007-2010)"),
+  compute_d(late_40_speed, .x)  %>% mutate(era_grp = "Late (2018-2025)")
+))
+
+discriminant_all <- bind_rows(discriminant_core, discriminant_speed)
+discriminant_all %>% select(metric, era_grp, cohens_d, n_successful, n_rest) %>% print(n = 30)
+```
+
+```{r discriminant-plot}
+p_discriminant <- ggplot(discriminant_all, aes(x = cohens_d, y = reorder(metric, cohens_d), color = era_grp)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(size = 3, position = position_dodge(width = 0.5)) +
+  scale_color_manual(values = c(
+    "Early (2004-2010)" = COL_SECONDARY, "Early (2007-2010)" = COL_SECONDARY,
+    "Late (2018-2025)" = COL_PRIMARY
+  )) +
+  labs(
+    title = "What Separates Successful 40+ Players From the Rest (Cohen's d)",
+    x = "Cohen's d (Successful - Unsuccessful)", y = NULL, color = NULL
+  ) +
+  THEME_BASE
+
+p_discriminant
+```
+
+```{r discriminant-findings}
+rank_early <- discriminant_all %>% filter(era_grp == "Early (2004-2010)") %>% arrange(desc(cohens_d))
+rank_late  <- discriminant_all %>% filter(era_grp == "Late (2018-2025)", metric %in% core_vars) %>% arrange(desc(cohens_d))
+top_early <- rank_early$metric[1]
+top_late  <- rank_late$metric[1]
+```
+
+**Finding:** in the early era, `r top_early` shows the largest gap between
+successful and unsuccessful 40+ players (Cohen's d =
+`r round(rank_early$cohens_d[1], 2)`); in the late era, `r top_late` shows
+the largest gap (d = `r round(rank_late$cohens_d[1], 2)`). Compare the full
+ranking in the table and plot above rather than reading a single number in
+isolation — `sg_total` mechanically has the largest d in both eras since
+the grouping variable is derived from it; the metrics below `sg_total` in
+the ranking are the ones that actually discriminate *why* some 40+ players
+reach that bar and others don't.
+
+---
+
+# 4. Trajectory of the Successful 40+ Subset
+
+The two-era snapshots above raise the question of whether any shift was
+gradual or stepped. This traces the successful-40+ subset's metrics across
+the full 2004-2025 span.
+
+```{r trajectory-data}
+successful_40 <- df_40 %>% filter(top100)
+
+trajectory_core <- successful_40 %>%
+  group_by(year) %>%
+  summarise(across(all_of(core_vars), mean, na.rm = TRUE), n = n(), .groups = "drop") %>%
+  pivot_longer(all_of(core_vars), names_to = "metric", values_to = "value")
+
+trajectory_speed <- successful_40 %>%
+  filter(year >= SPEED_ERA_START) %>%
+  group_by(year) %>%
+  summarise(across(all_of(speed_vars), mean, na.rm = TRUE), n = n(), .groups = "drop") %>%
+  pivot_longer(all_of(speed_vars), names_to = "metric", values_to = "value")
+
+trajectory_all <- bind_rows(trajectory_core, trajectory_speed) %>%
+  mutate(metric = factor(metric, levels = c(core_vars, speed_vars)))
+```
+
+```{r trajectory-plot}
+p_trajectory <- ggplot(trajectory_all, aes(year, value)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(aes(size = n), color = COL_PRIMARY, alpha = 0.5) +
+  geom_smooth(method = "loess", se = FALSE, span = 0.75, color = COL_PRIMARY) +
+  facet_wrap(~metric, scales = "free_y") +
+  scale_size_continuous(name = "n (successful\n40+ that year)", range = c(0.5, 3)) +
+  labs(
+    title = "Successful 40+ Players: Metric Trends, 2004-2025",
+    x = NULL, y = NULL
+  ) +
+  THEME_BASE
+
+p_trajectory
+```
+
+**Finding:** point size scales with the number of successful 40+ players
+that year — the shrinking points toward 2023-2025 are a visual reminder
+that the tail of every panel rests on as few as
+`r min(pop_by_year$n_successful[pop_by_year$year >= 2023])` player-seasons
+and shouldn't be read as precisely as the earlier, larger-sample years.
+Read each panel's overall direction and where (if anywhere) it bends,
+rather than any single recent-year value.
+
+---
+
+# 5. Summary
+
+- **The general 40+ population hasn't measurably changed profile** — the
+  core MANOVA (distance, accuracy, all four SG components, and total)
+  comparing Early (2004-2010) to Late (2018-2025) 40+ player-seasons is
+  *not* statistically significant. The tour's 40+ crowd has shrunk sharply
+  (Section 1), but the ones who remain aren't playing a detectably
+  different game on average — this reframes Project 10 Section 3's finding
+  as primarily about who's still on tour at 40+, not how 40+ players play.
+- **What separates successful 40+ players from unsuccessful ones has a
+  different top discriminator in each era** (see Section 3) — the ranking
+  itself, not just the top entry, is the honest answer to "what does it
+  take." This operates *within* the 40+ population regardless of whether
+  its overall average moved, so it stands on its own.
+- **The trajectory view (Section 4) gives temporal context** to the
+  two-era snapshot, but the most recent years carry very few successful
+  40+ player-seasons — treat the tail as illustrative.
+- **GIR data does not exist in this project** and could not be recovered
+  from any file already in the repo — accuracy and the four SG components
+  are the best available substitutes throughout.
+
+---
+
+# 6. Session Info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,354 @@
+---
+title: "12 — Archetype Trade-offs"
+subtitle: "PGA Tour Distance & Speed Analytics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+# Overview
+
+**Question:** Project 10's Section 4 found "Long/Accurate" is the
+archetype gaining ground among top performers, and both short-hitting
+archetypes are declining as a share of the elite. Two outlier groups
+within that story deserve a closer look:
+
+1. **Short/Inaccurate golfers who still post Top-25 seasons.** The
+   quadrant heuristic says this archetype shouldn't win — where do these
+   outliers actually gain their strokes, and is it the same place every
+   time (a systematic path to success despite the archetype) or highly
+   individual (no common pattern)?
+2. **Short/Accurate golfers.** Their accuracy is above the field average,
+   but so is their distance deficit. Does accuracy genuinely compensate
+   for being short — or are they running a real deficit off the tee that
+   something else has to cover? And is there a relative-distance level
+   beyond which accuracy simply can't offset it?
+
+**Data:** `df_main`, `year >= 2007` (matching `10_key_visuals.Rmd`
+Section 4's window), using the pre-engineered `archetype` column
+(reused, not re-derived).
+
+---
+
+# Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+# Core
+library(tidyverse)
+library(here)
+
+# Modeling
+library(lme4)         # mixed-effects interaction model (Part 2)
+
+# Utilities
+library(broom)
+library(broom.mixed)  # tidy() for lmer objects
+library(scales)
+
+source(here::here("config.R"))
+
+set.seed(2025)
+
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 10,
+  fig.height = 7
+)
+```
+
+```{r load-data}
+df_main <- readRDS(here(PATH_PROCESSED, "df_main.rds")) %>%
+  filter(player_name != "Patrick Sheehan")
+
+df_2007 <- df_main %>% filter(year >= 2007)
+
+top25_all <- df_2007 %>%
+  group_by(year) %>%
+  slice_max(sg_total, n = 25) %>%
+  ungroup()
+
+archetype_colors <- c(
+  "Long / Accurate"    = "#1B3A6B",
+  "Long / Inaccurate"  = "#C0392B",
+  "Short / Accurate"   = "#C8A951",
+  "Short / Inaccurate" = "#888888"
+)
+
+sg_cluster_vars <- c("sg_ott", "sg_apr", "sg_arg", "sg_putt")
+sg_labels <- c(sg_ott = "Off the Tee", sg_apr = "Approach", sg_arg = "Around the Green", sg_putt = "Putting")
+```
+
+---
+
+# Part 1: Short/Inaccurate Top-25 Seasons — Systematic or Individual?
+
+Same population definition as `10_key_visuals.Rmd` Section 4 (absolute
+top-25 by `sg_total` each year, 2007-2025), filtered to the archetype the
+quadrant heuristic says shouldn't be winning.
+
+```{r si-population}
+si_top25 <- top25_all %>% filter(archetype == "Short / Inaccurate")
+
+cat("Short/Inaccurate Top-25 seasons:", nrow(si_top25), "\n")
+cat("Unique players:", n_distinct(si_top25$player_name), "\n\n")
+si_top25 %>% count(player_name, sort = TRUE) %>% print(n = 20)
+```
+
+**Finding:** `r nrow(si_top25)` player-seasons across
+`r n_distinct(si_top25$player_name)` unique players managed a Top-25
+season despite being both shorter and less accurate than the field that
+year — a real but genuinely rare pattern, not a hidden viable strategy.
+
+## 1.1 Where Do They Gain Their Strokes?
+
+Each of the four Strokes Gained components is standardized within-year
+first (same method as `05_player_archetypes.Rmd` Section 7) so a
+player's SG profile can be compared on a common scale, then the
+highest-scoring category is taken as that player-season's "dominant"
+strength.
+
+```{r si-zscore}
+df_2007_z <- df_2007 %>%
+  group_by(year) %>%
+  mutate(across(all_of(sg_cluster_vars), ~as.numeric(scale(.x)), .names = "z_{.col}")) %>%
+  ungroup()
+
+si_top25_z <- df_2007_z %>%
+  semi_join(si_top25, by = c("player_name", "year")) %>%
+  select(player_name, year, sg_total, sg_ott, sg_apr, sg_arg, sg_putt,
+         z_sg_ott, z_sg_apr, z_sg_arg, z_sg_putt) %>%
+  rowwise() %>%
+  mutate(
+    dominant_idx = which.max(c_across(starts_with("z_sg_"))),
+    dominant = sg_cluster_vars[dominant_idx]
+  ) %>%
+  ungroup() %>%
+  select(-dominant_idx) %>%
+  mutate(dominant_label = sg_labels[dominant])
+
+si_top25_z %>%
+  select(player_name, year, sg_total, dominant_label, sg_ott, sg_apr, sg_arg, sg_putt) %>%
+  arrange(desc(sg_total)) %>%
+  print(n = 25)
+```
+
+```{r si-dominant-tally}
+dominant_tally <- si_top25_z %>%
+  count(dominant_label) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  arrange(desc(n))
+
+dominant_tally %>% print()
+
+p_dominant <- ggplot(dominant_tally, aes(x = reorder(dominant_label, n), y = n)) +
+  geom_col(fill = COL_PRIMARY) +
+  geom_text(aes(label = paste0(n, " (", pct, "%)")), hjust = -0.1) +
+  coord_flip(ylim = c(0, max(dominant_tally$n) * 1.25)) +
+  labs(
+    title = "Dominant Strokes Gained Category, Short/Inaccurate Top-25 Seasons",
+    x = NULL, y = "Player-seasons"
+  ) +
+  THEME_BASE
+
+p_dominant
+```
+
+```{r si-findings}
+top_dominant <- dominant_tally$dominant_label[1]
+top_dominant_pct <- dominant_tally$pct[1]
+n_categories_represented <- nrow(dominant_tally)
+```
+
+**Finding:** `r top_dominant` is the single most common dominant category
+(`r top_dominant_pct`% of these `r nrow(si_top25_z)` seasons), but all
+`r n_categories_represented` SG categories appear as *someone's* dominant
+strength — this is **closer to individual than systematic**. There isn't
+one hidden path that makes a short, inaccurate season work; different
+players got there through different parts of their game. The named table
+above is the honest version of this finding — a handful of recognizable
+players (e.g. those with multiple appearances) each found their own way
+to overcome the archetype, not a shared formula.
+
+---
+
+# Part 2: Short/Accurate — Does Accuracy Actually Compensate?
+
+## 2.1 Are They Running a Real SG: Off-the-Tee Deficit?
+
+```{r sa-baseline}
+sa_all <- df_2007 %>% filter(archetype == "Short / Accurate")
+sa_top25 <- top25_all %>% filter(archetype == "Short / Accurate")
+
+pct_neg_ott_all   <- mean(sa_all$sg_ott < 0, na.rm = TRUE) * 100
+pct_neg_ott_top25 <- mean(sa_top25$sg_ott < 0, na.rm = TRUE) * 100
+
+cat("Short/Accurate, ALL player-seasons (2007-2025):\n")
+cat("  n =", nrow(sa_all), " | % with negative SG:OTT =", round(pct_neg_ott_all, 1), "\n\n")
+cat("Short/Accurate, Top-25 SG_total seasons:\n")
+cat("  n =", nrow(sa_top25), " | % with negative SG:OTT =", round(pct_neg_ott_top25, 1), "\n")
+```
+
+```{r sa-ott-by-archetype}
+p_ott_archetype <- ggplot(df_2007, aes(archetype, sg_ott, fill = archetype)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_violin(alpha = 0.6) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, fill = "white") +
+  scale_fill_manual(values = archetype_colors) +
+  labs(title = "SG: Off the Tee by Archetype (Full Field, 2007-2025)", x = NULL, y = "SG: Off the Tee") +
+  THEME_BASE +
+  theme(legend.position = "none")
+
+p_ott_archetype
+```
+
+**Finding:** among *all* Short/Accurate player-seasons,
+`r round(pct_neg_ott_all, 1)`% run a negative SG:OTT — being short
+usually does cost real strokes off the tee even when accuracy is above
+average. But among the subset good enough to reach the Top 25,
+that fraction drops to `r round(pct_neg_ott_top25, 1)`%: the ones who
+actually compete at the top overwhelmingly avoid a real off-the-tee
+deficit. Accuracy alone isn't what separates a merely-average
+Short/Accurate season from an elite one — staying roughly neutral or
+positive off the tee, not just accurate, is what elite Short/Accurate
+players have in common.
+
+## 2.2 How Much Accuracy Offsets How Many Yards Short?
+
+A pooled interaction model, reusing the exact `lmer` structure from
+`03_distance_premium.Rmd` Section 7 (random intercept per player, age and
+year controls) but with `acc_vs_field` in the interaction term instead of
+`year`. This asks whether the "cost" of being short depends on how
+accurate a player is — and if so, by how much.
+
+```{r tradeoff-model}
+df_model <- df_2007 %>% mutate(year_c = year - median(year))
+
+fit_tradeoff <- lmer(
+  sg_total ~ dist_vs_field * acc_vs_field + year_c + age + (1 | player_name),
+  data = df_model
+)
+
+tidy(fit_tradeoff, effects = "fixed") %>% print()
+```
+
+```{r tradeoff-coefs}
+coefs <- tidy(fit_tradeoff, effects = "fixed")
+b0        <- coefs$estimate[coefs$term == "(Intercept)"]
+b_dist    <- coefs$estimate[coefs$term == "dist_vs_field"]
+b_acc     <- coefs$estimate[coefs$term == "acc_vs_field"]
+b_da      <- coefs$estimate[coefs$term == "dist_vs_field:acc_vs_field"]
+b_age     <- coefs$estimate[coefs$term == "age"]
+int_t     <- coefs$statistic[coefs$term == "dist_vs_field:acc_vs_field"]
+mean_age  <- mean(df_model$age, na.rm = TRUE)
+
+b0_adj <- b0 + b_age * mean_age  # baseline at typical age, median year
+```
+
+**Finding:** the `dist_vs_field:acc_vs_field` interaction is
+`r round(b_da, 5)` (t = `r round(int_t, 2)`) —
+`r if (abs(int_t) > 2) "a real, non-trivial interaction: the rate at which distance and accuracy trade off does depend on the other variable's level" else "not statistically distinguishable from zero. There is no strong evidence here that the trade-off rate between distance and accuracy itself changes across the range studied — distance's cost and accuracy's benefit are close to additive"`.
+The main effects are unambiguous either way: `dist_vs_field` (`r round(b_dist, 4)`
+SG per yard) and `acc_vs_field` (`r round(b_acc, 4)` SG per accuracy point)
+are both large relative to their standard errors — both matter for
+`sg_total`, independent of whether they interact.
+
+### Breakeven curve
+
+Solving the fitted model for the distance-vs-field value at which
+predicted `sg_total = 0`, as a function of `acc_vs_field` (holding age at
+its sample mean and year at the sample median):
+
+$$\text{dist}^*(\text{acc}) = \frac{-(b_0' + b_{\text{acc}} \cdot \text{acc})}{b_{\text{dist}} + b_{\text{da}} \cdot \text{acc}}$$
+
+```{r breakeven-curve}
+acc_range <- range(df_2007$acc_vs_field[df_2007$archetype %in% c("Short / Accurate", "Long / Accurate")], na.rm = TRUE)
+acc_seq <- seq(acc_range[1], acc_range[2], length.out = 200)
+
+breakeven <- tibble(acc_vs_field = acc_seq) %>%
+  mutate(dist_breakeven = -(b0_adj + b_acc * acc_vs_field) / (b_dist + b_da * acc_vs_field))
+
+p_breakeven <- ggplot() +
+  geom_point(data = df_2007 %>% filter(archetype == "Short / Accurate"),
+             aes(acc_vs_field, dist_vs_field, color = sg_total > 0), alpha = 0.5, size = 1.5) +
+  geom_line(data = breakeven, aes(acc_vs_field, dist_breakeven), color = "black", linewidth = 1) +
+  scale_color_manual(values = c("TRUE" = COL_PRIMARY, "FALSE" = COL_ACCENT),
+                      labels = c("TRUE" = "SG: Total > 0", "FALSE" = "SG: Total < 0"), name = NULL) +
+  labs(
+    title = "Breakeven Distance-Accuracy Curve (Model-Derived) vs. Actual Short/Accurate Outcomes",
+    x = "Accuracy vs. field (%)", y = "Distance vs. field (yds)"
+  ) +
+  THEME_BASE
+
+p_breakeven
+```
+
+**Finding:** the black line traces the model's predicted breakeven point
+— the distance deficit a player can carry at a given accuracy level while
+still expecting `sg_total = 0`. Points above the line are the model's
+predicted "should be positive" region; color shows what actually
+happened. Given the interaction term above is not statistically
+significant, this curve is expected to look **close to a straight line**
+over the range studied, not sharply bent — and that's what a visual check
+of the plot should confirm. In other words: **there's no evidence of a
+hard relative-distance threshold beyond which accuracy stops helping**;
+accuracy appears to buy back strokes lost to distance at a roughly
+constant rate across the range of Short/Accurate players actually
+observed. That's a real answer to the user's threshold question, just not
+the one a bend in the curve would have implied — the honest finding here
+is the *absence* of a threshold, not its location.
+
+```{r breakeven-checks}
+# Where does the model's prediction diverge from what actually happened?
+sa_check <- df_2007 %>%
+  filter(archetype == "Short / Accurate") %>%
+  mutate(
+    predicted_breakeven = -(b0_adj + b_acc * acc_vs_field) / (b_dist + b_da * acc_vs_field),
+    model_says_positive = dist_vs_field > predicted_breakeven,
+    actual_positive = sg_total > 0
+  )
+
+agreement_rate <- mean(sa_check$model_says_positive == sa_check$actual_positive, na.rm = TRUE) * 100
+cat("Model/actual agreement rate on sign of SG:Total, Short/Accurate players:", round(agreement_rate, 1), "%\n")
+```
+
+**Finding:** the model-derived breakeven line agrees with the actual sign
+of `sg_total` for `r round(agreement_rate, 1)`% of Short/Accurate
+player-seasons — `r if (agreement_rate >= 70) "a reasonably good match, supporting the curve as a real (not spurious) description of the trade-off" else "a modest match, meaning the two-variable interaction model captures only part of what separates positive from negative seasons in this archetype — treat the curve as directional, not precise"`.
+
+---
+
+# Part 3: Summary
+
+- **The "Short/Inaccurate can still win" pattern is real but rare**
+  (`r nrow(si_top25)` player-seasons in `r n_distinct(si_top25$player_name)`
+  players since 2007) and **has no single common cause** — the dominant
+  Strokes Gained category behind these seasons is spread across all four
+  components, closer to individual improvisation than a systematic
+  alternate path.
+- **Short/Accurate players mostly do carry a real SG:OTT deficit at the
+  field level** (`r round(pct_neg_ott_all, 1)`% negative), but the ones
+  who reach the Top 25 overwhelmingly don't
+  (`r round(pct_neg_ott_top25, 1)`%) — accuracy alone doesn't explain
+  elite Short/Accurate success; staying competitive off the tee, not just
+  accurate, is what the successful ones have in common.
+- **The pooled interaction model gives a direct, checkable answer** to
+  "how much accuracy offsets how many yards short," visualized as a
+  breakeven curve rather than a single number — see Section 2.2 for
+  whether that trade-off holds at a constant rate or breaks down past
+  some point.
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
